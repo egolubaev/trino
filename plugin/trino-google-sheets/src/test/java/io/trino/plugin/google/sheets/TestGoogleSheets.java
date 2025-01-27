@@ -86,7 +86,8 @@ public class TestGoogleSheets
                         new Sheet().setProperties(new SheetProperties().setTitle("Metadata")),
                         new Sheet().setProperties(new SheetProperties().setTitle("Number Text")),
                         new Sheet().setProperties(new SheetProperties().setTitle("Table with duplicate and missing column names")),
-                        new Sheet().setProperties(new SheetProperties().setTitle("Nation Insert test"))));
+                        new Sheet().setProperties(new SheetProperties().setTitle("Nation Insert test")),
+                        new Sheet().setProperties(new SheetProperties().setTitle("Number Text Truncate test"))));
 
         spreadsheet = sheetsService.spreadsheets().create(spreadsheet).setFields("spreadsheetId").execute();
         String spreadsheetId = spreadsheet.getSpreadsheetId();
@@ -96,12 +97,13 @@ public class TestGoogleSheets
                 ImmutableList.of("metadata_table", spreadsheetId + "#Metadata", "", "Self reference to this sheet as table"),
                 ImmutableList.of("number_text", spreadsheetId + "#Number Text", "alice", "Table to test type mapping"),
                 ImmutableList.of("table_with_duplicate_and_missing_column_names", spreadsheetId + "#Table with duplicate and missing column names", "bob", "Table to test behaviour with duplicate columns"),
-                ImmutableList.of("nation_insert_test", spreadsheetId + "#Nation Insert test", "", "Table containing tpch nation table to test inserts")));
+                ImmutableList.of("nation_insert_test", spreadsheetId + "#Nation Insert test", "", "Table containing tpch nation table to test inserts"),
+                ImmutableList.of("number_text_truncate_test", spreadsheetId + "#Number Text Truncate test", "", "Table to test truncate")));
         UpdateValuesResponse updateResult = sheetsService.spreadsheets().values()
                 .update(spreadsheetId, "Metadata", updateValues)
                 .setValueInputOption("RAW")
                 .execute();
-        assertThat(toIntExact(updateResult.getUpdatedRows())).isEqualTo(5);
+        assertThat(toIntExact(updateResult.getUpdatedRows())).isEqualTo(6);
 
         updateValues = new ValueRange().setValues(ImmutableList.of(
                 ImmutableList.of("number", "text"),
@@ -112,6 +114,12 @@ public class TestGoogleSheets
                 ImmutableList.of("5", "five")));
         updateResult = sheetsService.spreadsheets().values()
                 .update(spreadsheetId, "Number Text", updateValues)
+                .setValueInputOption("RAW")
+                .execute();
+        assertThat(toIntExact(updateResult.getUpdatedRows())).isEqualTo(6);
+
+        updateResult = sheetsService.spreadsheets().values()
+                .update(spreadsheetId, "Number Text Truncate test", updateValues)
                 .setValueInputOption("RAW")
                 .execute();
         assertThat(toIntExact(updateResult.getUpdatedRows())).isEqualTo(6);
@@ -137,7 +145,7 @@ public class TestGoogleSheets
     @Test
     public void testListTable()
     {
-        @Language("SQL") String expectedTableNamesStatement = "SELECT * FROM (VALUES 'metadata_table', 'number_text', 'table_with_duplicate_and_missing_column_names', 'nation_insert_test')";
+        @Language("SQL") String expectedTableNamesStatement = "SELECT * FROM (VALUES 'metadata_table', 'number_text', 'table_with_duplicate_and_missing_column_names', 'nation_insert_test', 'number_text_truncate_test')";
         assertQuery("show tables", expectedTableNamesStatement);
         assertQueryReturnsEmptyResult("SHOW TABLES IN gsheets.information_schema LIKE 'number_text'");
         assertQuery("select table_name from gsheets.information_schema.tables WHERE table_schema <> 'information_schema'", expectedTableNamesStatement);
@@ -313,6 +321,21 @@ public class TestGoogleSheets
                 new Duration(5, TimeUnit.MINUTES),
                 new Duration(30, TimeUnit.SECONDS),
                 () -> assertQuery("SELECT * FROM nation_insert_test", "SELECT * FROM nation"));
+    }
+
+    @Test
+    public void testTruncateTable()
+            throws Exception
+    {
+        assertQuery("SELECT count(*) FROM number_text_truncate_test", "SELECT 5");
+        assertUpdate("TRUNCATE TABLE number_text_truncate_test");
+        assertEventually(
+                new Duration(5, TimeUnit.MINUTES),
+                new Duration(30, TimeUnit.SECONDS),
+                () -> assertThat(query(
+                        "SELECT * FROM number_text_truncate_test"))
+                        .failure().hasMessageContaining(
+                                "No non-empty cells found in sheet"));
     }
 
     private Sheets getSheetsService()
