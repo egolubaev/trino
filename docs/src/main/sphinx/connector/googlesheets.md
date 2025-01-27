@@ -141,6 +141,7 @@ In addition to the {ref}`globally available <sql-globally-available>` and {ref}`
 this connector supports the following features:
 
 - {doc}`/sql/insert`
+- {doc}`/sql/truncate`
 
 ### Table functions
 
