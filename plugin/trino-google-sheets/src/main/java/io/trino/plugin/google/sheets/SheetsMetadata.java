@@ -223,10 +223,6 @@ public class SheetsMetadata
 
         String expression = sheetsClient.getCachedSheetExpressionForTable(namedTableHandle.tableName());
 
-        Logger log = Logger.get(SheetsMetadata.class);
-
-        log.info("Look expression: %s", expression);
-
         sheetsClient.clearSheet(expression);
     }
 }
