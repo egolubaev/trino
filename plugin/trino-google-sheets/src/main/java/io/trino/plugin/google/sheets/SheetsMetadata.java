@@ -16,7 +16,6 @@ package io.trino.plugin.google.sheets;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.inject.Inject;
-import io.airlift.log.Logger;
 import io.airlift.slice.Slice;
 import io.trino.spi.TrinoException;
 import io.trino.spi.connector.ColumnHandle;
@@ -222,10 +221,6 @@ public class SheetsMetadata
         }
 
         String expression = sheetsClient.getCachedSheetExpressionForTable(namedTableHandle.tableName());
-
-        Logger log = Logger.get(SheetsMetadata.class);
-
-        log.info("Look expression: %s", expression);
 
         sheetsClient.clearSheet(expression);
     }
