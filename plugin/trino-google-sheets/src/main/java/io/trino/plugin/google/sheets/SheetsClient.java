@@ -48,6 +48,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
@@ -55,7 +56,6 @@ import static com.google.common.collect.ImmutableList.toImmutableList;
 import static io.trino.cache.SafeCaches.buildNonEvictableCache;
 import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_BAD_CREDENTIALS_ERROR;
 import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_INSERT_ERROR;
-import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_INVALID_TABLE_FORMAT;
 import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_METASTORE_ERROR;
 import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_TABLE_LOAD_ERROR;
 import static io.trino.plugin.google.sheets.SheetsErrorCode.SHEETS_TRUNCATE_ERROR;
@@ -288,7 +288,7 @@ public class SheetsClient
     {
         if (sheetsConfig.getCredentialsFilePath().isPresent()) {
             try (InputStream in = new FileInputStream(sheetsConfig.getCredentialsFilePath().get())) {
-                return credentialFromStream(in, sheetsConfig.getDelegatedUserEmail());
+                return credentialFromStream(in);
             }
             catch (IOException e) {
                 throw new TrinoException(SHEETS_BAD_CREDENTIALS_ERROR, e);
@@ -298,7 +298,7 @@ public class SheetsClient
         if (sheetsConfig.getCredentialsKey().isPresent()) {
             try {
                 return credentialFromStream(
-                        new ByteArrayInputStream(Base64.getDecoder().decode(sheetsConfig.getCredentialsKey().get())), sheetsConfig.getDelegatedUserEmail());
+                                new ByteArrayInputStream(Base64.getDecoder().decode(sheetsConfig.getCredentialsKey().get())));
             }
             catch (IOException e) {
                 throw new TrinoException(SHEETS_BAD_CREDENTIALS_ERROR, e);
@@ -308,36 +308,56 @@ public class SheetsClient
         throw new TrinoException(SHEETS_BAD_CREDENTIALS_ERROR, "No sheets credentials were provided");
     }
 
-    private static Credential credentialFromStream(InputStream inputStream, Optional<String> delegatedUserEmail)
+    private static Credential credentialFromStream(InputStream inputStream)
             throws IOException
     {
-        GoogleCredential credential = GoogleCredential.fromStream(inputStream).createScoped(SCOPES);
-        delegatedUserEmail.ifPresent(credential::createDelegated);
-        return credential;
+        return GoogleCredential.fromStream(inputStream).createScoped(SCOPES);
     }
 
     private List<List<Object>> readAllValuesFromSheetExpression(String sheetExpression)
     {
-        try {
-            // by default loading up to 10k rows from the first tab of the sheet
-            String defaultRange = DEFAULT_RANGE;
-            String[] tableOptions = sheetExpression.split(RANGE_SEPARATOR);
-            String sheetId = tableOptions[0];
-            if (tableOptions.length > 1) {
-                defaultRange = tableOptions[1];
+        int maxRetries = 5;
+        int baseDelay = 1000; // Initial delay in milliseconds
+        int maxDelay = 5000; // Maximum delay of 5 seconds
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String defaultRange = DEFAULT_RANGE;
+                String[] tableOptions = sheetExpression.split(RANGE_SEPARATOR);
+                String sheetId = tableOptions[0];
+                if (tableOptions.length > 1) {
+                    defaultRange = tableOptions[1];
+                }
+                log.debug("Accessing sheet id [%s] with range [%s]", sheetId, defaultRange);
+
+                List<List<Object>> values = sheetsService.spreadsheets().values().get(sheetId, defaultRange).execute().getValues();
+                if (values == null) {
+                    throw new TrinoException(SHEETS_TABLE_LOAD_ERROR, "No non-empty cells found in sheet: " + sheetExpression);
+                }
+                return values;
             }
-            log.debug("Accessing sheet id [%s] with range [%s]", sheetId, defaultRange);
-            List<List<Object>> values = sheetsService.spreadsheets().values().get(sheetId, defaultRange).execute().getValues();
-            if (values == null) {
-                throw new TrinoException(SHEETS_INVALID_TABLE_FORMAT, "No non-empty cells found in sheet: " + sheetExpression);
+            catch (IOException e) {
+                log.warn("Attempt [%s]/[%s] failed due to IOException: [%s]", attempt, maxRetries, e.getMessage());
+
+                if (attempt == maxRetries) {
+                    // TODO: improve error to a {Table|Sheet}NotFoundException
+                    // is a backwards incompatible error code change from SHEETS_UNKNOWN_TABLE_ERROR -> NOT_FOUND
+                    throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Failed reading data from sheet: " + sheetExpression, e);
+                }
+
+                int jitter = ThreadLocalRandom.current().nextInt(500, 1500); // jitter between 0.5s - 1.5s
+                int delay = Math.min(baseDelay * (1 << (attempt - 1)) + jitter, maxDelay); // Cap at 5 seconds
+
+                try {
+                    Thread.sleep(delay);
+                }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Interrupted while retrying sheet read operation", ie);
+                }
             }
-            return values;
         }
-        catch (IOException e) {
-            // TODO: improve error to a {Table|Sheet}NotFoundException
-            // is a backwards incompatible error code change from SHEETS_UNKNOWN_TABLE_ERROR -> NOT_FOUND
-            throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Failed reading data from sheet: " + sheetExpression, e);
-        }
+        throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Unexpected error reading data from sheet: " + sheetExpression);
     }
 
     private HttpRequestInitializer setTimeout(HttpRequestInitializer requestInitializer, SheetsConfig config)
