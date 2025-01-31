@@ -48,6 +48,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
 
 import static com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
@@ -315,26 +316,48 @@ public class SheetsClient
 
     private List<List<Object>> readAllValuesFromSheetExpression(String sheetExpression)
     {
-        try {
-            // by default loading up to 10k rows from the first tab of the sheet
-            String defaultRange = DEFAULT_RANGE;
-            String[] tableOptions = sheetExpression.split(RANGE_SEPARATOR);
-            String sheetId = tableOptions[0];
-            if (tableOptions.length > 1) {
-                defaultRange = tableOptions[1];
+        int maxRetries = 5;
+        int baseDelay = 1000; // Initial delay in milliseconds
+        int maxDelay = 5000; // Maximum delay of 5 seconds
+
+        for (int attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                String defaultRange = DEFAULT_RANGE;
+                String[] tableOptions = sheetExpression.split(RANGE_SEPARATOR);
+                String sheetId = tableOptions[0];
+                if (tableOptions.length > 1) {
+                    defaultRange = tableOptions[1];
+                }
+                log.debug("Accessing sheet id [%s] with range [%s]", sheetId, defaultRange);
+
+                List<List<Object>> values = sheetsService.spreadsheets().values().get(sheetId, defaultRange).execute().getValues();
+                if (values == null) {
+                    throw new TrinoException(SHEETS_TABLE_LOAD_ERROR, "No non-empty cells found in sheet: " + sheetExpression);
+                }
+                return values;
             }
-            log.debug("Accessing sheet id [%s] with range [%s]", sheetId, defaultRange);
-            List<List<Object>> values = sheetsService.spreadsheets().values().get(sheetId, defaultRange).execute().getValues();
-            if (values == null) {
-                throw new TrinoException(SHEETS_TABLE_LOAD_ERROR, "No non-empty cells found in sheet: " + sheetExpression);
+            catch (IOException e) {
+                log.warn("Attempt [%s]/[%s] failed due to IOException: [%s]", attempt, maxRetries, e.getMessage());
+
+                if (attempt == maxRetries) {
+                    // TODO: improve error to a {Table|Sheet}NotFoundException
+                    // is a backwards incompatible error code change from SHEETS_UNKNOWN_TABLE_ERROR -> NOT_FOUND
+                    throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Failed reading data from sheet: " + sheetExpression, e);
+                }
+
+                int jitter = ThreadLocalRandom.current().nextInt(500, 1500); // jitter between 0.5s - 1.5s
+                int delay = Math.min(baseDelay * (1 << (attempt - 1)) + jitter, maxDelay); // Cap at 5 seconds
+
+                try {
+                    Thread.sleep(delay);
+                }
+                catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Interrupted while retrying sheet read operation", ie);
+                }
             }
-            return values;
         }
-        catch (IOException e) {
-            // TODO: improve error to a {Table|Sheet}NotFoundException
-            // is a backwards incompatible error code change from SHEETS_UNKNOWN_TABLE_ERROR -> NOT_FOUND
-            throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Failed reading data from sheet: " + sheetExpression, e);
-        }
+        throw new TrinoException(SHEETS_UNKNOWN_TABLE_ERROR, "Unexpected error reading data from sheet: " + sheetExpression);
     }
 
     private HttpRequestInitializer setTimeout(HttpRequestInitializer requestInitializer, SheetsConfig config)
