@@ -39,6 +39,7 @@ public class SheetsConfig
     private Duration connectionTimeout = new Duration(20, TimeUnit.SECONDS);
     private Duration readTimeout = new Duration(20, TimeUnit.SECONDS);
     private Duration writeTimeout = new Duration(20, TimeUnit.SECONDS);
+    private int maxRetryCount = 10;
 
     @AssertTrue(message = "Exactly one of 'gsheets.credentials-key' or 'gsheets.credentials-path' must be specified")
     public boolean isCredentialsConfigurationValid()
@@ -174,6 +175,20 @@ public class SheetsConfig
     public SheetsConfig setWriteTimeout(Duration writeTimeout)
     {
         this.writeTimeout = writeTimeout;
+        return this;
+    }
+
+    @Min(1)
+    public int getMaxRetryCount()
+    {
+        return maxRetryCount;
+    }
+
+    @Config("gsheets.max-retry-count")
+    @ConfigDescription("Maximum retries when requesting Google Sheets API")
+    public SheetsConfig setMaxRetryCount(int maxRetryCount)
+    {
+        this.maxRetryCount = maxRetryCount;
         return this;
     }
 }
