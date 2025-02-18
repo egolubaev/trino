@@ -81,6 +81,7 @@ public class SheetsClient
     private final LoadingCache<String, List<List<Object>>> sheetDataCache;
 
     private final Optional<String> metadataSheetId;
+    private final int maxRetryCount;
 
     private final Sheets sheetsService;
 
@@ -88,6 +89,7 @@ public class SheetsClient
     public SheetsClient(SheetsConfig config)
     {
         this.metadataSheetId = config.getMetadataSheetId();
+        this.maxRetryCount = config.getMaxRetryCount();
 
         try {
             this.sheetsService = new Sheets.Builder(newTrustedTransport(), JSON_FACTORY, setTimeout(getCredentials(config), config)).setApplicationName(APPLICATION_NAME).build();
@@ -299,9 +301,9 @@ public class SheetsClient
 
     private List<List<Object>> readAllValuesFromSheetExpression(String sheetExpression)
     {
-        int maxRetries = 5;
-        int baseDelay = 1000; // Initial delay in milliseconds
-        int maxDelay = 5000; // Maximum delay of 5 seconds
+        int maxRetries = maxRetryCount;
+        int baseDelay = 1000;
+        int maxDelay = 5000;
 
         for (int attempt = 1; attempt <= maxRetries; attempt++) {
             try {
