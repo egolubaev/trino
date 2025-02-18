@@ -602,8 +602,13 @@ public class TestIcebergV2
                     equalityFieldIds);
         }
 
-        // TODO: support read equality deletes with nested fields(https://github.com/trinodb/trino/issues/18625)
-        assertThat(query("SELECT * FROM " + tableName)).failure().hasMessageContaining("Multiple entries with same key");
+        assertThat(query("SELECT * FROM " + tableName))
+                .matches("VALUES (BIGINT '1', CAST(row(10, 100) AS ROW(nested BIGINT, nested_other BIGINT)))");
+
+        // verify that the equality delete is effective also when not specifying the corresponding column in the projection list
+        assertThat(query("SELECT id FROM " + tableName))
+                .matches("VALUES BIGINT '1'");
+
         assertUpdate("DROP TABLE " + tableName);
     }
 
@@ -1512,7 +1517,7 @@ public class TestIcebergV2
     @Test
     void testEnvironmentContext()
     {
-        try (TestTable table = new TestTable(getQueryRunner()::execute, "test_environment_context", "(x int)")) {
+        try (TestTable table = newTrinoTable("test_environment_context", "(x int)")) {
             Table icebergTable = loadTable(table.getName());
             assertThat(icebergTable.currentSnapshot().summary())
                     .contains(entry("engine-name", "trino"), entry("engine-version", "testversion"));

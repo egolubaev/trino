@@ -3,7 +3,8 @@
 ## Synopsis
 
 ```text
-[ WITH FUNCTION udf ]
+[ WITH SESSION [ name = expression [, ...] ]
+[ WITH [ FUNCTION udf ] [, ...] ]
 [ WITH [ RECURSIVE ] with_query [, ...] ]
 SELECT [ ALL | DISTINCT ] select_expression [, ...]
 [ FROM from_item [, ...] ]
@@ -1038,6 +1039,7 @@ ORDER BY regionkey FETCH FIRST ROW WITH TIES;
 (5 rows)
 ```
 
+(tablesample)=
 ## TABLESAMPLE
 
 There are multiple sample methods:
