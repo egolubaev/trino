@@ -51,7 +51,8 @@ public class TestSheetsConfig
                 .setSheetsDataExpireAfterWrite(new Duration(5, TimeUnit.MINUTES))
                 .setConnectionTimeout(new Duration(20, TimeUnit.SECONDS))
                 .setReadTimeout(new Duration(20, TimeUnit.SECONDS))
-                .setWriteTimeout(new Duration(20, TimeUnit.SECONDS)));
+                .setWriteTimeout(new Duration(20, TimeUnit.SECONDS))
+                .setMaxRetryCount(10));
     }
 
     @Test
@@ -68,6 +69,7 @@ public class TestSheetsConfig
                 .put("gsheets.connection-timeout", "1m")
                 .put("gsheets.read-timeout", "2m")
                 .put("gsheets.write-timeout", "3m")
+                .put("gsheets.max-retry-count", "5")
                 .buildOrThrow();
 
         ConfigurationFactory configurationFactory = new ConfigurationFactory(properties);
@@ -81,6 +83,7 @@ public class TestSheetsConfig
         assertThat(config.getConnectionTimeout()).isEqualTo(Duration.valueOf("1m"));
         assertThat(config.getReadTimeout()).isEqualTo(Duration.valueOf("2m"));
         assertThat(config.getWriteTimeout()).isEqualTo(Duration.valueOf("3m"));
+        assertThat(config.getMaxRetryCount()).isEqualTo(5);
     }
 
     @Test
@@ -92,6 +95,7 @@ public class TestSheetsConfig
                 .put("gsheets.max-data-cache-size", "2000")
                 .put("gsheets.data-cache-ttl", "10m")
                 .put("gsheets.read-timeout", "1m")
+                .put("gsheets.max-retry-count", "5")
                 .buildOrThrow();
 
         ConfigurationFactory configurationFactory = new ConfigurationFactory(properties);
@@ -103,6 +107,7 @@ public class TestSheetsConfig
         assertThat(config.getSheetsDataMaxCacheSize()).isEqualTo(2000);
         assertThat(config.getSheetsDataExpireAfterWrite()).isEqualTo(Duration.valueOf("10m"));
         assertThat(config.getReadTimeout()).isEqualTo(Duration.valueOf("1m"));
+        assertThat(config.getMaxRetryCount()).isEqualTo(5);
     }
 
     @Test
