@@ -240,7 +240,7 @@ public class SheetsClient
 
     public void clearSheet(String sheetExpression)
     {
-        SheetsSheetIdAndRange sheetIdAndRange = new SheetsSheetIdAndRange(sheetExpression);
+        SheetsSheetIdAndRange sheetIdAndRange = new SheetsSheetIdAndRange(sheetExpression + "!2:9999999");
         ClearValuesRequest clearValuesRequest = new ClearValuesRequest();
 
         try {
