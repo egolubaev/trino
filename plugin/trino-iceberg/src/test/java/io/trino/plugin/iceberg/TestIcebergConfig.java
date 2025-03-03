@@ -72,14 +72,15 @@ public class TestIcebergConfig
                 .setSortedWritingEnabled(true)
                 .setQueryPartitionFilterRequired(false)
                 .setQueryPartitionFilterRequiredSchemas(ImmutableSet.of())
-                .setSplitManagerThreads(Runtime.getRuntime().availableProcessors() * 2)
+                .setSplitManagerThreads(Integer.toString(Runtime.getRuntime().availableProcessors() * 2))
                 .setAllowedExtraProperties(ImmutableList.of())
                 .setIncrementalRefreshEnabled(true)
                 .setMetadataCacheEnabled(true)
                 .setIncrementalRefreshEnabled(true)
                 .setObjectStoreLayoutEnabled(false)
                 .setMetadataParallelism(8)
-                .setBucketExecutionEnabled(true));
+                .setBucketExecutionEnabled(true)
+                .setFileBasedConflictDetectionEnabled(true));
     }
 
     @Test
@@ -120,6 +121,7 @@ public class TestIcebergConfig
                 .put("iceberg.object-store-layout.enabled", "true")
                 .put("iceberg.metadata.parallelism", "10")
                 .put("iceberg.bucket-execution", "false")
+                .put("iceberg.file-based-conflict-detection", "false")
                 .buildOrThrow();
 
         IcebergConfig expected = new IcebergConfig()
@@ -150,14 +152,15 @@ public class TestIcebergConfig
                 .setSortedWritingEnabled(false)
                 .setQueryPartitionFilterRequired(true)
                 .setQueryPartitionFilterRequiredSchemas(ImmutableSet.of("bronze", "silver"))
-                .setSplitManagerThreads(42)
+                .setSplitManagerThreads("42")
                 .setAllowedExtraProperties(ImmutableList.of("propX", "propY"))
                 .setIncrementalRefreshEnabled(false)
                 .setMetadataCacheEnabled(false)
                 .setIncrementalRefreshEnabled(false)
                 .setObjectStoreLayoutEnabled(true)
                 .setMetadataParallelism(10)
-                .setBucketExecutionEnabled(false);
+                .setBucketExecutionEnabled(false)
+                .setFileBasedConflictDetectionEnabled(false);
 
         assertFullMapping(properties, expected);
     }

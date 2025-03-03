@@ -23,6 +23,7 @@ import com.google.common.collect.ImmutableSet;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.trino.Session;
+import io.trino.execution.StageInfo;
 import io.trino.filesystem.FileIterator;
 import io.trino.filesystem.Location;
 import io.trino.filesystem.TrinoFileSystem;
@@ -43,10 +44,12 @@ import io.trino.spi.connector.TableNotFoundException;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.TupleDomain;
 import io.trino.sql.planner.Plan;
+import io.trino.sql.planner.optimizations.PlanNodeSearcher;
 import io.trino.sql.planner.plan.ExchangeNode;
 import io.trino.sql.planner.plan.FilterNode;
 import io.trino.sql.planner.plan.OutputNode;
 import io.trino.sql.planner.plan.TableScanNode;
+import io.trino.sql.planner.plan.TableWriterNode;
 import io.trino.sql.planner.plan.ValuesNode;
 import io.trino.testing.BaseConnectorTest;
 import io.trino.testing.DistributedQueryRunner;
@@ -100,6 +103,7 @@ import java.util.stream.LongStream;
 import java.util.stream.Stream;
 
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Preconditions.checkState;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.collect.ImmutableList.toImmutableList;
 import static com.google.common.collect.ImmutableMap.toImmutableMap;
@@ -109,9 +113,12 @@ import static com.google.common.collect.MoreCollectors.onlyElement;
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
 import static io.trino.SystemSessionProperties.DETERMINE_PARTITION_COUNT_FOR_WRITE_ENABLED;
 import static io.trino.SystemSessionProperties.ENABLE_DYNAMIC_FILTERING;
+import static io.trino.SystemSessionProperties.MAX_HASH_PARTITION_COUNT;
+import static io.trino.SystemSessionProperties.MAX_WRITER_TASK_COUNT;
 import static io.trino.SystemSessionProperties.SCALE_WRITERS;
 import static io.trino.SystemSessionProperties.TASK_MAX_WRITER_COUNT;
 import static io.trino.SystemSessionProperties.TASK_MIN_WRITER_COUNT;
+import static io.trino.SystemSessionProperties.TASK_SCALE_WRITERS_ENABLED;
 import static io.trino.SystemSessionProperties.USE_PREFERRED_WRITE_PARTITIONING;
 import static io.trino.plugin.iceberg.IcebergFileFormat.AVRO;
 import static io.trino.plugin.iceberg.IcebergFileFormat.ORC;
@@ -1440,11 +1447,11 @@ public abstract class BaseIcebergConnectorTest
         // Insert "large" number of rows, supposedly topping over iceberg.writer-sort-buffer-size so that temporary files are utilized by the sorting writer.
         assertUpdate(
                 """
-                INSERT INTO %s
-                SELECT v.*
-                FROM (VALUES %s, %s, %s) v
-                CROSS JOIN UNNEST (sequence(1, 10_000)) a(i)
-                """.formatted(tableName, values, highValues, lowValues), 30000);
+                        INSERT INTO %s
+                        SELECT v.*
+                        FROM (VALUES %s, %s, %s) v
+                        CROSS JOIN UNNEST (sequence(1, 10_000)) a(i)
+                        """.formatted(tableName, values, highValues, lowValues), 30000);
 
         assertUpdate("DROP TABLE " + tableName);
     }
@@ -1694,7 +1701,7 @@ public abstract class BaseIcebergConnectorTest
         // extra insert which should be dropped on rollback
         assertUpdate("INSERT INTO test_rollback (col0, col1) VALUES (999, CAST(999 AS BIGINT))", 1);
 
-        assertUpdate(format("ALTER TABLE tpch.test_rollback EXECUTE rollback_to_snapshot(%s)", afterSecondInsertId));
+        assertUpdate(format(rollbackToSnapshotFormat, afterSecondInsertId));
         assertQuery("SELECT * FROM test_rollback ORDER BY col0", "VALUES (789, CAST(987 AS BIGINT))");
 
         assertUpdate("DROP TABLE test_rollback");
@@ -5293,6 +5300,40 @@ public abstract class BaseIcebergConnectorTest
     }
 
     @Test
+    public void testMaxWriterTaskCount()
+    {
+        int workerCount = getQueryRunner().getNodeCount();
+        checkState(workerCount > 1, "testMaxWriterTaskCount requires multiple workers");
+
+        assertUpdate("CREATE TABLE test_max_writer_task_count_insert (id BIGINT) WITH (partitioning = ARRAY['id'])");
+
+        Session session = Session.builder(getSession())
+                // disable writer scaling for the test
+                .setSystemProperty(SCALE_WRITERS, "false")
+                .setSystemProperty(TASK_SCALE_WRITERS_ENABLED, "false")
+                // limit number of writer tasks to 1
+                .setSystemProperty(MAX_WRITER_TASK_COUNT, "1")
+                .setSystemProperty(MAX_HASH_PARTITION_COUNT, Integer.toString(workerCount))
+                .build();
+        QueryId id = getDistributedQueryRunner()
+                .executeWithPlan(session, """
+                        INSERT INTO test_max_writer_task_count_insert
+                        SELECT * FROM TABLE(sequence(start => 0, stop => 100, step => 1))
+                        """)
+                .queryId();
+        StageInfo writerStage = getDistributedQueryRunner().getCoordinator()
+                .getFullQueryInfo(id)
+                .getOutputStage()
+                .orElseThrow()
+                .getSubStages()
+                .getFirst();
+        assertThat(PlanNodeSearcher.searchFrom(writerStage.getPlan().getRoot()).whereIsInstanceOfAny(TableWriterNode.class).matches()).isTrue();
+        assertThat(writerStage.getTasks().size()).isEqualTo(1);
+
+        assertUpdate("DROP TABLE IF EXISTS test_max_writer_task_count_insert");
+    }
+
+    @Test
     public void testOptimize()
             throws Exception
     {
@@ -8187,35 +8228,35 @@ public abstract class BaseIcebergConnectorTest
                 TestTable dimensionTable = newTrinoTable("dimension_table", "(date date, following_holiday boolean, year int)")) {
             assertUpdate(
                     """
-                    INSERT INTO %s
-                    VALUES
-                        (DATE '2023-01-01' , false, 2023),
-                        (DATE '2023-01-02' , true, 2023),
-                        (DATE '2023-01-03' , false, 2023)""".formatted(dimensionTable.getName()), 3);
+                            INSERT INTO %s
+                            VALUES
+                                (DATE '2023-01-01' , false, 2023),
+                                (DATE '2023-01-02' , true, 2023),
+                                (DATE '2023-01-03' , false, 2023)""".formatted(dimensionTable.getName()), 3);
             assertUpdate(
                     """
-                    INSERT INTO %s
-                    VALUES
-                        (DATE '2023-01-02' , '#2023#1', DECIMAL '122.12'),
-                        (DATE '2023-01-02' , '#2023#2', DECIMAL '124.12'),
-                        (DATE '2023-01-02' , '#2023#3', DECIMAL '99.99'),
-                        (DATE '2023-01-02' , '#2023#4', DECIMAL '95.12'),
-                        (DATE '2023-01-03' , '#2023#5', DECIMAL '199.12'),
-                        (DATE '2023-01-04' , '#2023#6', DECIMAL '99.55'),
-                        (DATE '2023-01-05' , '#2023#7', DECIMAL '50.11'),
-                        (DATE '2023-01-05' , '#2023#8', DECIMAL '60.20'),
-                        (DATE '2023-01-05' , '#2023#9', DECIMAL '70.75'),
-                        (DATE '2023-01-05' , '#2023#10', DECIMAL '80.12')""".formatted(salesTable.getName()), 10);
+                            INSERT INTO %s
+                            VALUES
+                                (DATE '2023-01-02' , '#2023#1', DECIMAL '122.12'),
+                                (DATE '2023-01-02' , '#2023#2', DECIMAL '124.12'),
+                                (DATE '2023-01-02' , '#2023#3', DECIMAL '99.99'),
+                                (DATE '2023-01-02' , '#2023#4', DECIMAL '95.12'),
+                                (DATE '2023-01-03' , '#2023#5', DECIMAL '199.12'),
+                                (DATE '2023-01-04' , '#2023#6', DECIMAL '99.55'),
+                                (DATE '2023-01-05' , '#2023#7', DECIMAL '50.11'),
+                                (DATE '2023-01-05' , '#2023#8', DECIMAL '60.20'),
+                                (DATE '2023-01-05' , '#2023#9', DECIMAL '70.75'),
+                                (DATE '2023-01-05' , '#2023#10', DECIMAL '80.12')""".formatted(salesTable.getName()), 10);
 
             String selectQuery =
                     """
-                    SELECT receipt_id
-                    FROM %s s
-                    JOIN %s d
-                        ON  s.date = d.date
-                    WHERE
-                        d.following_holiday = true AND
-                        d.date BETWEEN DATE '2023-01-01' AND DATE '2024-01-01'""".formatted(salesTable.getName(), dimensionTable.getName());
+                            SELECT receipt_id
+                            FROM %s s
+                            JOIN %s d
+                                ON  s.date = d.date
+                            WHERE
+                                d.following_holiday = true AND
+                                d.date BETWEEN DATE '2023-01-01' AND DATE '2024-01-01'""".formatted(salesTable.getName(), dimensionTable.getName());
             MaterializedResultWithPlan result = getDistributedQueryRunner().executeWithPlan(
                     Session.builder(getSession())
                             .setCatalogSessionProperty(catalog, DYNAMIC_FILTERING_WAIT_TIMEOUT, "10s")
@@ -8619,7 +8660,8 @@ public abstract class BaseIcebergConnectorTest
         }
     }
 
-    @Test // regression test for https://github.com/trinodb/trino/issues/22922
+    // regression test for https://github.com/trinodb/trino/issues/22922
+    @Test
     void testArrayElementChange()
     {
         try (TestTable table = newTrinoTable(

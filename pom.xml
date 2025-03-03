@@ -5,12 +5,12 @@
     <parent>
         <groupId>io.airlift</groupId>
         <artifactId>airbase</artifactId>
-        <version>215</version>
+        <version>219</version>
     </parent>
 
     <groupId>io.trino</groupId>
     <artifactId>trino-root</artifactId>
-    <version>470</version>
+    <version>471</version>
     <packaging>pom</packaging>
 
     <name>${project.artifactId}</name>
@@ -36,7 +36,6 @@
         <module>core/trino-parser</module>
         <module>core/trino-server</module>
         <module>core/trino-server-main</module>
-        <module>core/trino-server-rpm</module>
         <module>core/trino-spi</module>
         <module>core/trino-web-ui</module>
         <module>docs</module>
@@ -59,6 +58,7 @@
         <module>lib/trino-parquet</module>
         <module>lib/trino-plugin-toolkit</module>
         <module>lib/trino-record-decoder</module>
+        <module>plugin/trino-ai-functions</module>
         <module>plugin/trino-base-jdbc</module>
         <module>plugin/trino-bigquery</module>
         <module>plugin/trino-blackhole</module>
@@ -142,14 +142,14 @@
     <scm child.scm.connection.inherit.append.path="false" child.scm.developerConnection.inherit.append.path="false" child.scm.url.inherit.append.path="false">
         <connection>scm:git:git://github.com/trinodb/trino.git</connection>
         <developerConnection>scm:git:git@github.com:trinodb/trino.git</developerConnection>
-        <tag>470</tag>
+        <tag>471</tag>
         <url>https://github.com/trinodb/trino</url>
     </scm>
 
     <properties>
         <project.build.targetJdk>23</project.build.targetJdk>
         <!-- for reproducible build support, updated by release plugin -->
-        <project.build.outputTimestamp>2025-02-06T01:32:43Z</project.build.outputTimestamp>
+        <project.build.outputTimestamp>2025-02-20T01:16:00Z</project.build.outputTimestamp>
         <!-- TODO remove this property when no module overrides it -->
         <trino.error-prone.guarded-by>ERROR</trino.error-prone.guarded-by>
 
@@ -182,25 +182,25 @@
         <air.test.jvm.additional-arguments>${air.test.jvm.additional-arguments.default}</air.test.jvm.additional-arguments>
 
         <!-- keep dependency properties sorted -->
-        <dep.airlift.version>302</dep.airlift.version>
+        <dep.airlift.version>306</dep.airlift.version>
         <dep.alluxio.version>2.9.6</dep.alluxio.version>
         <dep.antlr.version>4.13.2</dep.antlr.version>
         <dep.avro.version>1.12.0</dep.avro.version>
-        <dep.aws-sdk.version>1.12.780</dep.aws-sdk.version>
+        <dep.aws-sdk.version>1.12.781</dep.aws-sdk.version>
         <dep.cassandra.version>4.17.0</dep.cassandra.version>
         <dep.confluent.version>7.7.1</dep.confluent.version>
         <dep.docker.images.version>108</dep.docker.images.version>
         <dep.drift.version>1.22</dep.drift.version>
-        <dep.flyway.version>11.3.0</dep.flyway.version>
+        <dep.flyway.version>11.3.2</dep.flyway.version>
         <dep.frontend-maven-plugin.version>1.15.1</dep.frontend-maven-plugin.version>
         <dep.frontend-node.version>v22.13.1</dep.frontend-node.version>
         <dep.frontend-npm.version>11.1.0</dep.frontend-npm.version>
         <dep.gib.version>4.5.4</dep.gib.version>
-        <dep.google.http.client.version>1.45.3</dep.google.http.client.version>
+        <dep.google.http.client.version>1.46.1</dep.google.http.client.version>
         <dep.httpcore5.version>5.3.3</dep.httpcore5.version>
         <dep.iceberg.version>1.7.1</dep.iceberg.version>
         <dep.jna.version>5.16.0</dep.jna.version>
-        <dep.joda.version>2.13.0</dep.joda.version>
+        <dep.joda.version>2.13.1</dep.joda.version>
         <dep.jsonwebtoken.version>0.12.6</dep.jsonwebtoken.version>
         <dep.jts.version>1.20.0</dep.jts.version>
         <dep.kafka-clients.version>3.9.0</dep.kafka-clients.version>
@@ -211,7 +211,7 @@
         <dep.snowflake.version>3.22.0</dep.snowflake.version>
         <dep.swagger.version>2.2.28</dep.swagger.version>
         <dep.takari.version>2.2.0</dep.takari.version>
-        <dep.tcnative.version>2.0.69.Final</dep.tcnative.version>
+        <dep.tcnative.version>2.0.70.Final</dep.tcnative.version>
         <dep.tempto.version>202</dep.tempto.version>
         <dep.wire.version>4.9.11</dep.wire.version>
         <dep.zookeeper.version>3.9.3</dep.zookeeper.version>
@@ -269,7 +269,7 @@
             <dependency>
                 <groupId>io.netty</groupId>
                 <artifactId>netty-bom</artifactId>
-                <version>4.1.117.Final</version>
+                <version>4.1.118.Final</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -277,7 +277,7 @@
             <dependency>
                 <groupId>org.apache.arrow</groupId>
                 <artifactId>arrow-bom</artifactId>
-                <version>18.1.0</version>
+                <version>18.2.0</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -285,7 +285,7 @@
             <dependency>
                 <groupId>org.jdbi</groupId>
                 <artifactId>jdbi3-bom</artifactId>
-                <version>3.47.0</version>
+                <version>3.48.0</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -309,7 +309,7 @@
             <dependency>
                 <groupId>software.amazon.awssdk</groupId>
                 <artifactId>bom</artifactId>
-                <version>2.30.12</version>
+                <version>2.30.23</version>
                 <type>pom</type>
                 <scope>import</scope>
             </dependency>
@@ -454,7 +454,7 @@
             <dependency>
                 <groupId>com.github.luben</groupId>
                 <artifactId>zstd-jni</artifactId>
-                <version>1.5.6-9</version>
+                <version>1.5.6-10</version>
             </dependency>
 
             <dependency>
@@ -564,7 +564,7 @@
             <dependency>
                 <groupId>com.nimbusds</groupId>
                 <artifactId>oauth2-oidc-sdk</artifactId>
-                <version>11.21.3</version>
+                <version>11.23</version>
                 <classifier>jdk11</classifier>
             </dependency>
 
@@ -897,13 +897,13 @@
             <dependency>
                 <groupId>io.projectreactor</groupId>
                 <artifactId>reactor-core</artifactId>
-                <version>3.7.2</version>
+                <version>3.7.3</version>
             </dependency>
 
             <dependency>
                 <groupId>io.projectreactor.netty</groupId>
                 <artifactId>reactor-netty-core</artifactId>
-                <version>1.1.26</version>
+                <version>1.1.27</version>
             </dependency>
 
             <!-- io.confluent:kafka-avro-serializer uses multiple versions of this transitive dependency -->
@@ -1405,12 +1405,6 @@
 
             <dependency>
                 <groupId>io.trino</groupId>
-                <artifactId>trino-server-rpm</artifactId>
-                <version>${project.version}</version>
-            </dependency>
-
-            <dependency>
-                <groupId>io.trino</groupId>
                 <artifactId>trino-session-property-managers</artifactId>
                 <version>${project.version}</version>
             </dependency>
@@ -1686,7 +1680,7 @@
             <dependency>
                 <groupId>net.minidev</groupId>
                 <artifactId>json-smart</artifactId>
-                <version>2.5.1</version>
+                <version>2.5.2</version>
             </dependency>
 
             <dependency>
@@ -1921,6 +1915,12 @@
                         <artifactId>slf4j-api</artifactId>
                     </exclusion>
                 </exclusions>
+            </dependency>
+
+            <dependency>
+                <groupId>org.apache.iceberg</groupId>
+                <artifactId>iceberg-aws</artifactId>
+                <version>${dep.iceberg.version}</version>
             </dependency>
 
             <dependency>
@@ -2320,7 +2320,7 @@
             <dependency>
                 <groupId>org.yaml</groupId>
                 <artifactId>snakeyaml</artifactId>
-                <version>2.3</version>
+                <version>2.4</version>
             </dependency>
 
             <dependency>

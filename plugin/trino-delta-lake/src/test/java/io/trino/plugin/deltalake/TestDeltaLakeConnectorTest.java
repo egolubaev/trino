@@ -147,8 +147,6 @@ public class TestDeltaLakeConnectorTest
                     .put("delta.enable-non-concurrent-writes", "true")
                     .put("delta.register-table-procedure.enabled", "true")
                     .buildOrThrow());
-            metastore = TestingDeltaLakeUtils.getConnectorService(queryRunner, HiveMetastoreFactory.class)
-                    .createMetastore(Optional.empty());
 
             queryRunner.execute("CREATE SCHEMA " + SCHEMA + " WITH (location = 's3://" + bucketName + "/" + SCHEMA + "')");
             queryRunner.execute("CREATE SCHEMA schemawithoutunderscore WITH (location = 's3://" + bucketName + "/schemawithoutunderscore')");
@@ -5213,6 +5211,24 @@ public class TestDeltaLakeConnectorTest
             assertThat(metastore.getTable(SCHEMA, table.getName()).orElseThrow().getParameters())
                     .doesNotContainKeys("trino_last_transaction_version", "trino_metadata_schema_string")
                     .contains(entry("comment", "Presto View"));
+        }
+    }
+
+    // test writing checkpoint to exceed default page size limit
+    @Test
+    public void testWriteLargeCheckpoint()
+    {
+        int columnSize = 100;
+        String columns = IntStream.range(0, columnSize)
+                .mapToObj("data_%d bigint"::formatted)
+                .collect(Collectors.joining(", ", "(", ")"));
+        int size = 200;
+        try (TestTable table = newTrinoTable("test_large_checkpoint", columns + " WITH (checkpoint_interval = %d)".formatted(size))) {
+            for (int i = 0; i < size; i++) {
+                String value = ",%d".formatted(i).repeat(columnSize).substring(1);
+                assertUpdate("INSERT INTO " + table.getName() + " VALUES (" + value + ")", 1);
+            }
+            assertQuery("SELECT COUNT(*) FROM " + table.getName(), "VALUES " + size);
         }
     }
 }

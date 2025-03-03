@@ -66,6 +66,7 @@ import io.trino.transaction.TransactionId;
 import io.trino.util.Ciphers;
 import jakarta.ws.rs.NotFoundException;
 
+import java.io.EOFException;
 import java.net.URI;
 import java.util.List;
 import java.util.Map;
@@ -78,6 +79,7 @@ import java.util.concurrent.ScheduledExecutorService;
 
 import static com.google.common.base.MoreObjects.firstNonNull;
 import static com.google.common.base.Preconditions.checkArgument;
+import static com.google.common.base.Throwables.getCausalChain;
 import static com.google.common.base.Verify.verify;
 import static com.google.common.util.concurrent.Futures.immediateFuture;
 import static com.google.common.util.concurrent.Futures.immediateVoidFuture;
@@ -91,6 +93,7 @@ import static io.trino.memory.context.AggregatedMemoryContext.newSimpleAggregate
 import static io.trino.server.protocol.ProtocolUtil.createColumn;
 import static io.trino.server.protocol.ProtocolUtil.toStatementStats;
 import static io.trino.server.protocol.QueryInfoUrlFactory.getQueryInfoUri;
+import static io.trino.server.protocol.QueryResultRows.empty;
 import static io.trino.server.protocol.QueryResultRows.queryResultRowsBuilder;
 import static io.trino.server.protocol.Slug.Context.EXECUTING_QUERY;
 import static io.trino.spi.StandardErrorCode.SERIALIZATION_ERROR;
@@ -182,7 +185,7 @@ class Query
     private Optional<Throwable> typeSerializationException = Optional.empty();
 
     @GuardedBy("this")
-    private Long updateCount;
+    private OptionalLong updateCount = OptionalLong.empty();
 
     public static Query create(
             Session session,
@@ -440,13 +443,12 @@ class Query
             resultRows = removePagesFromExchange(queryInfo, targetResultSize.toBytes());
         }
         else {
-            resultRows = queryResultRowsBuilder(session).build();
+            resultRows = empty();
         }
 
-        if ((queryInfo.updateType() != null) && (updateCount == null)) {
+        if ((queryInfo.updateType() != null) && updateCount.isEmpty()) {
             // grab the update count for non-queries
-            Optional<Long> updatedRowsCount = resultRows.getUpdateCount();
-            updateCount = updatedRowsCount.orElse(null);
+            updateCount = resultRows.getUpdateCount();
         }
 
         if (isStarted && (queryInfo.outputStage().isEmpty() || exchangeDataSource.isFinished())) {
@@ -512,7 +514,7 @@ class Query
                 getQueryInfoUri(queryInfoUrl, queryId, externalUriInfo),
                 partialCancelUri,
                 nextResultsUri,
-                resultRows.getColumns().orElse(null),
+                resultRows.getOptionalColumns(),
                 queryDataProducer.produce(externalUriInfo, session, resultRows, this::handleSerializationException),
                 toStatementStats(queryInfo),
                 toQueryError(queryInfo, typeSerializationException),
@@ -549,7 +551,7 @@ class Query
     private synchronized QueryResultRows removePagesFromExchange(ResultQueryInfo queryInfo, long targetResultBytes)
     {
         if (!resultsConsumed && queryInfo.outputStage().isEmpty()) {
-            return queryResultRowsBuilder(session)
+            return queryResultRowsBuilder()
                     .withColumnsAndTypes(ImmutableList.of(), ImmutableList.of())
                     .build();
         }
@@ -558,7 +560,7 @@ class Query
         // client while holding the lock because the query may transition to the finished state when the
         // last page is removed.  If another thread observes this state before the response is cached
         // the pages will be lost.
-        QueryResultRows.Builder resultBuilder = queryResultRowsBuilder(session)
+        QueryResultRows.Builder resultBuilder = queryResultRowsBuilder()
                 .withColumnsAndTypes(columns, types);
 
         try {
@@ -636,17 +638,28 @@ class Query
 
     private synchronized void handleSerializationException(Throwable exception)
     {
+        if (clientDisconnected(exception)) {
+            // Allow client to retry nextURI call
+            return;
+        }
+
         // failQuery can throw exception if query has already finished.
         try {
             queryManager.failQuery(queryId, exception);
         }
         catch (RuntimeException e) {
-            log.debug(e, "Could not fail query");
+            log.warn(e, "Could not fail query");
         }
 
         if (typeSerializationException.isEmpty()) {
             typeSerializationException = Optional.of(exception);
         }
+    }
+
+    private static boolean clientDisconnected(Throwable exception)
+    {
+        return getCausalChain(exception).stream()
+                .anyMatch(EOFException.class::isInstance);
     }
 
     private synchronized void setQueryOutputInfo(QueryExecution.QueryOutputInfo outputInfo)
