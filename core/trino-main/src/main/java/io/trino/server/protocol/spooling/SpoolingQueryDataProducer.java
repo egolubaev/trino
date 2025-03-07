@@ -20,6 +20,7 @@ import io.trino.client.spooling.DataAttributes;
 import io.trino.client.spooling.EncodedQueryData;
 import io.trino.server.ExternalUriInfo;
 import io.trino.server.protocol.OutputColumn;
+import io.trino.server.protocol.QueryDataProducer;
 import io.trino.server.protocol.QueryResultRows;
 import io.trino.spi.Page;
 import io.trino.spi.TrinoException;
@@ -31,6 +32,7 @@ import java.net.URI;
 import java.util.List;
 import java.util.function.Consumer;
 
+import static com.google.common.base.Verify.verify;
 import static io.trino.client.spooling.DataAttribute.ROWS_COUNT;
 import static io.trino.client.spooling.DataAttribute.ROW_OFFSET;
 import static io.trino.client.spooling.Segment.inlined;
@@ -39,15 +41,16 @@ import static io.trino.server.protocol.spooling.CoordinatorSegmentResource.spool
 import static io.trino.spi.StandardErrorCode.SERIALIZATION_ERROR;
 import static java.util.Objects.requireNonNull;
 
-public class SpooledQueryDataProducer
+public class SpoolingQueryDataProducer
         implements QueryDataProducer
 {
+    private boolean closed;
     private final QueryDataEncoder.Factory encoderFactory;
     private QueryDataEncoder encoder;
 
     private long currentOffset;
 
-    public SpooledQueryDataProducer(QueryDataEncoder.Factory encoderFactory)
+    public SpoolingQueryDataProducer(QueryDataEncoder.Factory encoderFactory)
     {
         this.encoderFactory = requireNonNull(encoderFactory, "encoderFactory is null");
     }
@@ -59,6 +62,7 @@ public class SpooledQueryDataProducer
             return null;
         }
 
+        verify(!closed, "SpoolingQueryDataProducer is already closed");
         EncodedQueryData.Builder builder = EncodedQueryData.builder(encoderFactory.encoding());
         UriBuilder uriBuilder = spooledSegmentUriBuilder(uriInfo);
         if (encoder == null) {
@@ -105,6 +109,21 @@ public class SpooledQueryDataProducer
         return builder.build();
     }
 
+    @Override
+    public synchronized void close()
+    {
+        if (closed) {
+            return;
+        }
+
+        // For empty results encoder will never be created
+        if (encoder != null) {
+            encoder.close();
+        }
+        encoder = null;
+        closed = true;
+    }
+
     private URI buildSegmentDownloadURI(UriBuilder builder, Slice identifier)
     {
         return builder.clone().path("download/{identifier}").build(identifier.toStringUtf8());
@@ -118,10 +137,5 @@ public class SpooledQueryDataProducer
     private boolean hasSpoolingMetadata(Page page, int outputColumnsSize)
     {
         return page.getChannelCount() == outputColumnsSize + 1 && page.getPositionCount() == 1 && !page.getBlock(outputColumnsSize).isNull(0);
-    }
-
-    public static QueryDataProducer createSpooledQueryDataProducer(QueryDataEncoder.Factory encoder)
-    {
-        return new SpooledQueryDataProducer(encoder);
     }
 }

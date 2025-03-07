@@ -11,21 +11,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package io.trino.cache;
+package io.trino.server;
 
-import jakarta.annotation.Nonnull;
+import org.junit.jupiter.api.Test;
 
-import java.lang.annotation.Retention;
-import java.lang.annotation.Target;
-
-import static java.lang.annotation.ElementType.TYPE;
-import static java.lang.annotation.RetentionPolicy.SOURCE;
-
-/**
- * Copy of package-private {@code com.google.common.cache.ElementTypesAreNonnullByDefault}.
- * Exists to suppress IDE warnings when extending Guava Cache classes.
- */
-@Retention(SOURCE)
-@Target(TYPE)
-@Nonnull
-@interface ElementTypesAreNonnullByDefault {}
+public class TestDummy
+{
+    @Test
+    public void buildRequiresTestToExist() {}
+}
