@@ -49,6 +49,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static com.google.api.client.googleapis.javanet.GoogleNetHttpTransport.newTrustedTransport;
 import static com.google.common.base.Throwables.throwIfInstanceOf;
@@ -240,11 +242,27 @@ public class SheetsClient
 
     public void clearSheet(String sheetExpression)
     {
-        SheetsSheetIdAndRange sheetIdAndRange = new SheetsSheetIdAndRange(sheetExpression + "!2:9999999");
+        String[] parts = sheetExpression.split("#", 3);
+        String sheetId = parts[0];
+        String sheetName = null;
+        String range = "2:9999999";
+
+        if (parts.length > 1) {
+            Matcher sheetMatcher = Pattern.compile("^[A-Za-z0-9_]+$").matcher(parts[1]);
+            if (sheetMatcher.matches()) {
+                sheetName = parts[1];
+            }
+        }
+
+        if (parts.length > 2) {
+            sheetName = parts[1];
+        }
+
+        String sheetRange = (sheetName != null ? sheetName + "!" : "") + range;
         ClearValuesRequest clearValuesRequest = new ClearValuesRequest();
 
         try {
-            sheetsService.spreadsheets().values().clear(sheetIdAndRange.getSheetId(), sheetIdAndRange.getRange(), clearValuesRequest).execute();
+            sheetsService.spreadsheets().values().clear(sheetId, sheetRange, clearValuesRequest).execute();
         }
         catch (IOException e) {
             throw new TrinoException(SHEETS_TRUNCATE_ERROR, "Error truncating data in sheet: ", e);
