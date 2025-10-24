@@ -32,6 +32,7 @@ The following configuration properties are available:
 | `gsheets.connection-timeout`   | Timeout when connection to Google Sheets API, defaults to `20s`                   |
 | `gsheets.read-timeout`         | Timeout when reading from Google Sheets API, defaults to `20s`                    |
 | `gsheets.write-timeout`        | Timeout when writing to Google Sheets API, defaults to `20s`                      |
+| `gsheets.max-retry-count`      | How many times to retry failed Google Sheets API requests `10`                    |
 
 ## Credentials
 
