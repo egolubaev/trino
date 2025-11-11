@@ -13,7 +13,7 @@ function free_up_disk_space_ubuntu()
         'mysql-server-core-*'
         'powershell*')
 
-    sudo apt-get --auto-remove -y purge "${packages[@]}"
+    sudo apt-get --auto-remove -y purge "${packages[@]}" || true
 
     echo "Autoremoving packages"
     sudo apt-get autoremove -y
