@@ -36,6 +36,7 @@ import io.trino.cost.CostComparator;
 import io.trino.cost.StatsAndCosts;
 import io.trino.cost.StatsCalculatorModule;
 import io.trino.cost.TaskCountEstimator;
+import io.trino.cte.CteMaterializationOrchestrator;
 import io.trino.dispatcher.DispatchExecutor;
 import io.trino.dispatcher.DispatchManager;
 import io.trino.dispatcher.DispatchQueryFactory;
@@ -213,6 +214,8 @@ public class CoordinatorModule
 
         // dispatcher
         binder.bind(DispatchManager.class).in(Scopes.SINGLETON);
+        // CTE materialization orchestrator (runs internal scratch CTAS / DROP)
+        binder.bind(CteMaterializationOrchestrator.class).in(Scopes.SINGLETON);
         // WITH SESSION interpreter
         binder.bind(SessionPropertyResolver.class).in(Scopes.SINGLETON);
         // export under the old name, for backwards compatibility

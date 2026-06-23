@@ -18,6 +18,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.inject.Inject;
 import io.airlift.concurrent.SetThreadName;
+import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.opentelemetry.api.trace.Span;
@@ -28,6 +29,9 @@ import io.trino.SystemSessionProperties;
 import io.trino.cost.CachingTableStatsProvider;
 import io.trino.cost.CostCalculator;
 import io.trino.cost.StatsCalculator;
+import io.trino.cte.CteMaterializationOrchestrator;
+import io.trino.cte.CteMaterializer;
+import io.trino.cte.CteMaterializer.CteCandidate;
 import io.trino.exchange.ExchangeManagerRegistry;
 import io.trino.exchange.ExchangeMetricsCollector;
 import io.trino.execution.QueryPreparer.PreparedQuery;
@@ -63,6 +67,7 @@ import io.trino.sql.analyzer.Analyzer;
 import io.trino.sql.analyzer.AnalyzerFactory;
 import io.trino.sql.planner.AdaptivePlanner;
 import io.trino.sql.planner.InputExtractor;
+import io.trino.sql.parser.SqlParser;
 import io.trino.sql.planner.LogicalPlanner;
 import io.trino.sql.planner.NodePartitioningManager;
 import io.trino.sql.planner.Plan;
@@ -81,6 +86,7 @@ import io.trino.sql.tree.Statement;
 
 import java.time.Instant;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -105,6 +111,7 @@ import static io.trino.spi.StandardErrorCode.STACK_OVERFLOW;
 import static io.trino.sql.planner.sanity.PlanSanityChecker.DISTRIBUTED_PLAN_SANITY_CHECKER;
 import static io.trino.tracing.ScopedSpan.scopedSpan;
 import static java.lang.Thread.currentThread;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
@@ -112,6 +119,8 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 public class SqlQueryExecution
         implements QueryExecution
 {
+    private static final Logger log = Logger.get(SqlQueryExecution.class);
+
     private final QueryStateMachine stateMachine;
     private final Slug slug;
     private final Tracer tracer;
@@ -139,6 +148,9 @@ public class SqlQueryExecution
     private final ExecutionPolicy executionPolicy;
     private final SplitSchedulerStats schedulerStats;
     private final Analysis analysis;
+    private final PreparedQuery preparedQuery;
+    private final AnalyzerFactory analyzerFactory;
+    private final CteMaterializationOrchestrator cteMaterializationOrchestrator;
     private final StatsCalculator statsCalculator;
     private final CostCalculator costCalculator;
     private final DynamicFilterService dynamicFilterService;
@@ -157,6 +169,7 @@ public class SqlQueryExecution
             Tracer tracer,
             PlannerContext plannerContext,
             AnalyzerFactory analyzerFactory,
+            CteMaterializationOrchestrator cteMaterializationOrchestrator,
             SplitSourceFactory splitSourceFactory,
             NodePartitioningManager nodePartitioningManager,
             NodeScheduler nodeScheduler,
@@ -217,6 +230,10 @@ public class SqlQueryExecution
             this.scheduleSplitBatchSize = scheduleSplitBatchSize;
 
             this.stateMachine = requireNonNull(stateMachine, "stateMachine is null");
+
+            this.preparedQuery = requireNonNull(preparedQuery, "preparedQuery is null");
+            this.analyzerFactory = requireNonNull(analyzerFactory, "analyzerFactory is null");
+            this.cteMaterializationOrchestrator = requireNonNull(cteMaterializationOrchestrator, "cteMaterializationOrchestrator is null");
 
             // analyze query
             this.analysis = analyze(preparedQuery, stateMachine, warningCollector, planOptimizersStatsCollector, analyzerFactory);
@@ -488,6 +505,9 @@ public class SqlQueryExecution
 
     private PlanRoot doPlanQuery(CachingTableStatsProvider tableStatsProvider)
     {
+        // optionally materialize multiply-referenced CTEs into scratch tables and re-analyze
+        Analysis planAnalysis = maybeMaterializeCtes();
+
         // plan query
         PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
         LogicalPlanner logicalPlanner = new LogicalPlanner(
@@ -500,7 +520,7 @@ public class SqlQueryExecution
                 stateMachine.getWarningCollector(),
                 planOptimizersStatsCollector,
                 tableStatsProvider);
-        Plan plan = logicalPlanner.plan(analysis);
+        Plan plan = logicalPlanner.plan(planAnalysis);
         queryPlan.set(plan);
 
         // fragment the plan
@@ -514,10 +534,77 @@ public class SqlQueryExecution
             stateMachine.setInputs(new InputExtractor(plannerContext.getMetadata(), stateMachine.getSession()).extractInputs(fragmentedPlan));
         }
 
-        stateMachine.setOutput(analysis.getTarget());
+        stateMachine.setOutput(planAnalysis.getTarget());
 
-        boolean explainAnalyze = analysis.getStatement() instanceof ExplainAnalyze;
+        boolean explainAnalyze = planAnalysis.getStatement() instanceof ExplainAnalyze;
         return new PlanRoot(fragmentedPlan, !explainAnalyze);
+    }
+
+    /**
+     * If CTE materialization is enabled and the statement has eligible multiply-referenced CTEs,
+     * materialize each into a per-query scratch table (committed in its own transaction), rewrite the
+     * statement to read the scratch tables, and return a fresh analysis of the rewritten statement.
+     * On any failure the feature degrades to normal inlining (returns the original analysis); scratch
+     * tables created before the failure are dropped by the terminal-state cleanup listener.
+     */
+    private Analysis maybeMaterializeCtes()
+    {
+        Session session = stateMachine.getSession();
+        if (!SystemSessionProperties.isCteMaterializationEnabled(session)) {
+            return analysis;
+        }
+        if (session.getCatalog().isEmpty() || session.getSchema().isEmpty()) {
+            // need a default catalog.schema to place scratch tables
+            return analysis;
+        }
+        Statement statement = preparedQuery.getStatement();
+        List<CteCandidate> candidates = CteMaterializer.findCandidates(statement);
+        if (candidates.isEmpty()) {
+            return analysis;
+        }
+
+        Map<String, String> nameToScratch = new LinkedHashMap<>();
+        try {
+            for (CteCandidate candidate : candidates) {
+                String scratchTable = scratchTableName(session, candidate.name());
+                // register cleanup before running so a later failure still drops this table
+                registerScratchCleanup(session, scratchTable);
+                cteMaterializationOrchestrator.materialize(session, scratchTable, candidate.bodySql());
+                nameToScratch.put(candidate.name(), scratchTable);
+            }
+            Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, new SqlParser());
+            Analyzer analyzer = analyzerFactory.createAnalyzer(
+                    session,
+                    preparedQuery.getParameters(),
+                    bindParameters(rewritten, preparedQuery.getParameters()),
+                    stateMachine.getWarningCollector(),
+                    planOptimizersStatsCollector);
+            Analysis rewrittenAnalysis = analyzer.analyze(rewritten);
+            log.info("CTE materialization: query %s materialized %s CTE(s) into scratch tables %s",
+                    stateMachine.getQueryId(), nameToScratch.size(), nameToScratch.values());
+            return rewrittenAnalysis;
+        }
+        catch (RuntimeException e) {
+            // the feature must never break a query: fall back to inlining the original statement
+            log.warn(e, "CTE materialization failed for query %s; falling back to inlining", stateMachine.getQueryId());
+            return analysis;
+        }
+    }
+
+    private static String scratchTableName(Session session, String cteName)
+    {
+        String sanitized = cteName.toLowerCase(ENGLISH).replaceAll("[^a-z0-9_]", "_");
+        return session.getCatalog().orElseThrow() + "." + session.getSchema().orElseThrow()
+                + ".cte_" + sanitized + "_" + session.getQueryId().getId();
+    }
+
+    private void registerScratchCleanup(Session session, String scratchTable)
+    {
+        stateMachine.addStateChangeListener(state -> {
+            if (state.isDone()) {
+                cteMaterializationOrchestrator.cleanupAsync(session, scratchTable);
+            }
+        });
     }
 
     private void planDistribution(PlanRoot plan, CachingTableStatsProvider tableStatsProvider)
@@ -784,6 +871,7 @@ public class SqlQueryExecution
         private final int scheduleSplitBatchSize;
         private final PlannerContext plannerContext;
         private final AnalyzerFactory analyzerFactory;
+        private final CteMaterializationOrchestrator cteMaterializationOrchestrator;
         private final SplitSourceFactory splitSourceFactory;
         private final NodePartitioningManager nodePartitioningManager;
         private final NodeScheduler nodeScheduler;
@@ -817,6 +905,7 @@ public class SqlQueryExecution
                 QueryManagerConfig config,
                 PlannerContext plannerContext,
                 AnalyzerFactory analyzerFactory,
+                CteMaterializationOrchestrator cteMaterializationOrchestrator,
                 SplitSourceFactory splitSourceFactory,
                 NodePartitioningManager nodePartitioningManager,
                 NodeScheduler nodeScheduler,
@@ -849,6 +938,7 @@ public class SqlQueryExecution
             this.scheduleSplitBatchSize = config.getScheduleSplitBatchSize();
             this.plannerContext = requireNonNull(plannerContext, "plannerContext is null");
             this.analyzerFactory = requireNonNull(analyzerFactory, "analyzerFactory is null");
+            this.cteMaterializationOrchestrator = requireNonNull(cteMaterializationOrchestrator, "cteMaterializationOrchestrator is null");
             this.splitSourceFactory = requireNonNull(splitSourceFactory, "splitSourceFactory is null");
             this.nodePartitioningManager = requireNonNull(nodePartitioningManager, "nodePartitioningManager is null");
             this.nodeScheduler = requireNonNull(nodeScheduler, "nodeScheduler is null");
@@ -897,6 +987,7 @@ public class SqlQueryExecution
                     tracer,
                     plannerContext,
                     analyzerFactory,
+                    cteMaterializationOrchestrator,
                     splitSourceFactory,
                     nodePartitioningManager,
                     nodeScheduler,

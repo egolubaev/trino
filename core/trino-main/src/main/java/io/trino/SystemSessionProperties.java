@@ -222,6 +222,7 @@ public final class SystemSessionProperties
     public static final String DEBUG_ADAPTIVE_PLANNER = "debug_adaptive_planner";
     public static final String SOURCE_PAGES_VALIDATION_ENABLED = "output_pages_validation_enabled";
     public static final String SPOOLING_UNSUPPORTED_WARNING = "spooling_unsupported_warning";
+    public static final String CTE_MATERIALIZATION_ENABLED = "cte_materialization_enabled";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -280,6 +281,11 @@ public final class SystemSessionProperties
                         DETERMINE_PARTITION_COUNT_FOR_WRITE_ENABLED,
                         "Determine the number of partitions based on amount of data read and processed by the query for write queries",
                         queryManagerConfig.isDeterminePartitionCountForWriteEnabled(),
+                        false),
+                booleanProperty(
+                        CTE_MATERIALIZATION_ENABLED,
+                        "Materialize multiply-referenced CTEs into per-query scratch tables before executing the main query",
+                        false,
                         false),
                 integerProperty(
                         MAX_HASH_PARTITION_COUNT,
@@ -1224,6 +1230,11 @@ public final class SystemSessionProperties
     public static boolean isRedistributeWrites(Session session)
     {
         return session.getSystemProperty(REDISTRIBUTE_WRITES, Boolean.class);
+    }
+
+    public static boolean isCteMaterializationEnabled(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_ENABLED, Boolean.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)
