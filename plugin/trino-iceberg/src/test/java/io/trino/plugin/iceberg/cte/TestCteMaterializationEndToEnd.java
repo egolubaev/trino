@@ -193,6 +193,50 @@ public class TestCteMaterializationEndToEnd
                 .isTrue();
     }
 
+    @Test
+    public void testMultiCteChainMaterializesSharedDependency()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".src3");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".src3 AS " +
+                "SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50), (3, 60)) t(k, v)");
+
+        // a is shared by b and c (referenced twice) and b, c are each referenced twice -> all three materialize.
+        // b and c's scratch CTAS must read a's scratch table, not re-scan src3.
+        @Language("SQL") String query =
+                "WITH a AS (SELECT k, v FROM iceberg." + SCHEMA + ".src3), " +
+                "     b AS (SELECT k, sum(v) AS s FROM a GROUP BY k), " +
+                "     c AS (SELECT k, count(*) AS cnt FROM a GROUP BY k) " +
+                "SELECT b1.k, b1.s, c1.cnt " +
+                "FROM b b1 JOIN b b2 ON b1.k = b2.k " +
+                "JOIN c c1 ON c1.k = b1.k JOIN c c2 ON c2.k = c1.k " +
+                "ORDER BY b1.k";
+
+        Session disabled = getSession();
+        Session enabled = Session.builder(disabled)
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
+                .build();
+
+        MaterializedResult expected = runner.execute(disabled, query);
+        MaterializedResult actual = runner.execute(enabled, query);
+        assertThat(actual.getMaterializedRows()).isEqualTo(expected.getMaterializedRows());
+
+        // all three CTEs were materialized
+        assertThat(scratchSubmittedFor(runner, ".cte_a_")).as("shared dependency a materialized").isTrue();
+        assertThat(scratchSubmittedFor(runner, ".cte_b_")).as("b materialized").isTrue();
+        assertThat(scratchSubmittedFor(runner, ".cte_c_")).as("c materialized").isTrue();
+
+        // dependent CTAS for b reads a's scratch table (proves dependency rewrite, not a re-scan of src3)
+        boolean bReadsScratchA = runner.getCoordinator().getQueryManager().getQueries().stream()
+                .map(BasicQueryInfo::getQuery)
+                .map(sql -> sql.toLowerCase(ENGLISH))
+                .anyMatch(sql -> sql.startsWith("create table") && sql.contains(".cte_b_") && sql.contains(".cte_a_"));
+        assertThat(bReadsScratchA)
+                .as("b's scratch CTAS should read a's scratch table, not re-scan the base source")
+                .isTrue();
+    }
+
     private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)
     {
         return runner.getCoordinator().getQueryManager().getQueries().stream()

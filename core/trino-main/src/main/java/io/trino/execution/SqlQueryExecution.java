@@ -566,15 +566,19 @@ public class SqlQueryExecution
         }
 
         Map<String, String> nameToScratch = new LinkedHashMap<>();
+        SqlParser parser = new SqlParser();
         try {
+            // candidates are in WITH-declaration order, so a dependency's scratch table is committed
+            // before any CTE that reads it; buildScratchSource resolves inner references against nameToScratch
             for (CteCandidate candidate : candidates) {
                 String scratchTable = scratchTableName(session, candidate.name());
+                String scratchSource = CteMaterializer.buildScratchSource(statement, candidate.name(), nameToScratch, parser);
                 // register cleanup before running so a later failure still drops this table
                 registerScratchCleanup(session, scratchTable);
-                cteMaterializationOrchestrator.materialize(session, scratchTable, candidate.bodySql());
+                cteMaterializationOrchestrator.materialize(session, scratchTable, scratchSource);
                 nameToScratch.put(candidate.name(), scratchTable);
             }
-            Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, new SqlParser());
+            Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, parser);
             Analyzer analyzer = analyzerFactory.createAnalyzer(
                     session,
                     preparedQuery.getParameters(),

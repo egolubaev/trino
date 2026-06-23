@@ -89,13 +89,16 @@ public class TestCteMaterializer
     }
 
     @Test
-    public void ignoresCteWhoseBodyReferencesAnotherCte()
+    public void materializesCteThatReferencesAnotherCte()
     {
-        // y references CTE x (not standalone) -> y excluded; x referenced only once (inside y) -> excluded
-        assertThat(CteMaterializer.findCandidates(parse(
+        // y references sibling x and is itself referenced twice -> y is materialized (x inlined into its CTAS);
+        // x is referenced only once (inside y) -> x stays inline
+        List<CteCandidate> candidates = CteMaterializer.findCandidates(parse(
                 "WITH x AS (SELECT a FROM t), y AS (SELECT a FROM x) " +
-                "SELECT * FROM y p JOIN y q ON p.a = q.a")))
-                .isEmpty();
+                "SELECT * FROM y p JOIN y q ON p.a = q.a"));
+        assertThat(candidates)
+                .extracting(CteCandidate::name)
+                .containsExactly("y");
     }
 
     @Test
@@ -104,6 +107,88 @@ public class TestCteMaterializer
         assertThat(CteMaterializer.findCandidates(parse(
                 "WITH x(c) AS (SELECT a FROM t) SELECT * FROM x p JOIN x q ON p.c = q.c")))
                 .isEmpty();
+    }
+
+    @Test
+    public void linearChainMaterializesOnlyMultiplyReferencedCte()
+    {
+        // a is referenced once (inside b); b is referenced twice -> only b is a candidate, a is inlined into b's CTAS
+        List<CteCandidate> candidates = CteMaterializer.findCandidates(parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a) " +
+                "SELECT * FROM b x JOIN b y ON x.k = y.k"));
+        assertThat(candidates)
+                .extracting(CteCandidate::name, CteCandidate::referenceCount)
+                .containsExactly(tuple("b", 2));
+    }
+
+    @Test
+    public void sharedDependencyInChainIsMaterialized()
+    {
+        // a is referenced twice (by b and c); b and c are each referenced twice -> all three are candidates
+        List<CteCandidate> candidates = CteMaterializer.findCandidates(parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a), c AS (SELECT k FROM a) " +
+                "SELECT * FROM b j1 JOIN b j2 ON j1.k = j2.k JOIN c k1 ON k1.k = j1.k JOIN c k2 ON k2.k = k1.k"));
+        assertThat(candidates)
+                .extracting(CteCandidate::name, CteCandidate::referenceCount)
+                .containsExactly(tuple("a", 2), tuple("b", 2), tuple("c", 2));
+    }
+
+    @Test
+    public void ignoresChainThatIsTransitivelyNonDeterministic()
+    {
+        // b's body is deterministic on its own, but it depends on a which uses rand() -> b must not be materialized
+        assertThat(CteMaterializer.findCandidates(parse(
+                "WITH a AS (SELECT rand() AS r FROM t), b AS (SELECT r FROM a) " +
+                "SELECT * FROM b x JOIN b y ON x.r = y.r")))
+                .as("a CTE that transitively depends on rand() must not be materialized")
+                .isEmpty();
+    }
+
+    @Test
+    public void ignoresCteWithDependencyAndNestedWith()
+    {
+        // b depends on sibling a AND has its own nested WITH -> excluded (cannot wrap body in a dependency WITH)
+        assertThat(CteMaterializer.findCandidates(parse(
+                "WITH a AS (SELECT k FROM t), b AS (WITH w AS (SELECT k FROM a) SELECT k FROM w) " +
+                "SELECT * FROM b x JOIN b y ON x.k = y.k")))
+                .extracting(CteCandidate::name)
+                .doesNotContain("b");
+    }
+
+    @Test
+    public void buildScratchSourceInlinesUnmaterializedDependency()
+    {
+        Statement stmt = parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a) " +
+                "SELECT * FROM b x JOIN b y ON x.k = y.k");
+        // no scratch tables yet -> a is inlined into b's CTAS via a WITH clause
+        String source = normalize(CteMaterializer.buildScratchSource(stmt, "b", Map.of(), SQL_PARSER));
+        assertThat(source).contains("WITH a AS");
+        assertThat(source).contains("FROM t");
+    }
+
+    @Test
+    public void buildScratchSourceRedefinesMaterializedDependencyAsScratchScan()
+    {
+        Statement stmt = parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a) " +
+                "SELECT * FROM b x JOIN b y ON x.k = y.k");
+        // a already materialized -> b's CTAS reads a's scratch table, not the original source t
+        String source = normalize(CteMaterializer.buildScratchSource(stmt, "b", Map.of("a", "cat.sch.scratch_a"), SQL_PARSER));
+        assertThat(source).contains("scratch_a");
+        assertThat(source).doesNotContain("FROM t");
+    }
+
+    @Test
+    public void buildScratchSourceForIndependentCteIsJustItsBody()
+    {
+        Statement stmt = parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a) " +
+                "SELECT * FROM b x JOIN b y ON x.k = y.k");
+        // a has no sibling dependencies -> its CTAS source is just its body, no wrapping WITH
+        String source = normalize(CteMaterializer.buildScratchSource(stmt, "a", Map.of(), SQL_PARSER));
+        assertThat(source).doesNotContainIgnoringCase("WITH");
+        assertThat(source).contains("FROM t");
     }
 
     @Test
@@ -122,5 +207,11 @@ public class TestCteMaterializer
     private static Statement parse(String sql)
     {
         return SQL_PARSER.createStatement(sql);
+    }
+
+    private static String normalize(String sql)
+    {
+        // collapse SqlFormatter's line breaks/indentation so substring assertions are layout-independent
+        return sql.replaceAll("\\s+", " ").trim();
     }
 }

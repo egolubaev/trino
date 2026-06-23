@@ -25,8 +25,12 @@ import io.trino.sql.tree.With;
 import io.trino.sql.tree.WithQuery;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -35,18 +39,27 @@ import static java.util.Locale.ENGLISH;
 /**
  * Pure-AST detection and rewrite for staged CTE materialization.
  * <p>
- * Detection finds top-level WITH entries that are worth (and safe to) materialize into a per-query
- * scratch table. Rewrite swaps each materialized CTE's body for {@code SELECT * FROM <scratch>},
- * leaving every reference to the CTE untouched — re-analysis re-resolves them to the scratch scan and
- * predicate/projection pushdown still specializes per consumer.
+ * Detection ({@link #findCandidates}) finds top-level WITH entries that are worth (and safe to)
+ * materialize into a per-query scratch table. Rewrite ({@link #rewrite}) swaps each materialized CTE's
+ * body for {@code SELECT * FROM <scratch>} in the main query; re-analysis re-resolves every reference to
+ * the scratch scan, and predicate/projection pushdown still specializes per consumer.
  * <p>
- * SPIKE/M1 gates (conservative — anything not matching falls back to normal inlining):
+ * A materialized CTE may itself reference earlier CTEs. {@link #buildScratchSource} constructs each
+ * scratch CTAS so those inner references resolve: dependencies that were themselves materialized are
+ * redefined as {@code SELECT * FROM <their scratch>}; dependencies that were not materialized are inlined
+ * (their original bodies, transitively) via a WITH clause on the CTAS. Materializing in WITH-declaration
+ * order guarantees a dependency's scratch table is committed before any CTE that reads it.
+ * <p>
+ * Eligibility gates (conservative — anything not matching falls back to normal inlining):
  * <ul>
- *   <li>statement is a {@link Query} with a non-recursive {@link With};</li>
- *   <li>the CTE is referenced at least twice;</li>
+ *   <li>statement is a {@link Query} with a non-recursive {@link With} and no CTE-dependency cycle;</li>
+ *   <li>the CTE is referenced at least twice across the whole statement (main query + sibling bodies);</li>
  *   <li>the CTE has no explicit column-alias list (kept simple for now);</li>
- *   <li>the CTE body references no other CTE (so it is a standalone CTAS);</li>
- *   <li>the CTE body is deterministic (no rand/uuid/now/shuffle and no CURRENT_* contextual values).</li>
+ *   <li>the CTE and every CTE in its transitive dependency closure are deterministic (no
+ *       rand/uuid/now/shuffle and no CURRENT_* contextual values) — otherwise materializing one
+ *       evaluation and reusing it would change results;</li>
+ *   <li>a CTE that depends on a sibling must not itself contain a nested WITH (so its body can be wrapped
+ *       in a dependency WITH clause without merging scopes).</li>
  * </ul>
  */
 public final class CteMaterializer
@@ -57,7 +70,7 @@ public final class CteMaterializer
 
     private CteMaterializer() {}
 
-    public record CteCandidate(String name, String bodySql, int referenceCount) {}
+    public record CteCandidate(String name, int referenceCount) {}
 
     public static List<CteCandidate> findCandidates(Statement statement)
     {
@@ -70,33 +83,101 @@ public final class CteMaterializer
         }
         List<WithQuery> withQueries = with.getQueries();
         Set<String> cteNames = withQueries.stream()
-                .map(wq -> wq.getName().getValue().toLowerCase(ENGLISH))
+                .map(CteMaterializer::cteName)
                 .collect(Collectors.toSet());
+
+        // direct sibling-CTE dependencies of each CTE body
+        Map<String, Set<String>> directDeps = new HashMap<>();
+        for (WithQuery withQuery : withQueries) {
+            directDeps.put(cteName(withQuery), referencedCtes(withQuery.getQuery(), cteNames));
+        }
+        // defensive: a valid non-recursive WITH cannot have a dependency cycle, but never risk infinite recursion
+        if (hasCycle(cteNames, directDeps)) {
+            return ImmutableList.of();
+        }
+        Map<String, WithQuery> byName = withQueries.stream()
+                .collect(Collectors.toMap(CteMaterializer::cteName, wq -> wq, (a, b) -> a, LinkedHashMap::new));
+        Map<String, Boolean> deterministic = new HashMap<>();
 
         List<CteCandidate> candidates = new ArrayList<>();
         for (WithQuery withQuery : withQueries) {
-            String name = withQuery.getName().getValue().toLowerCase(ENGLISH);
+            String name = cteName(withQuery);
             if (withQuery.getColumnNames().isPresent()) {
                 continue;
             }
-            if (referencesAnyCte(withQuery.getQuery(), cteNames)) {
+            if (!isDeterministicTransitively(name, byName, directDeps, deterministic)) {
                 continue;
             }
-            if (!isDeterministic(withQuery.getQuery())) {
+            // a CTE that wraps its body in a dependency WITH clause must not already carry its own WITH
+            if (!directDeps.get(name).isEmpty() && bodyHasWith(withQuery.getQuery())) {
                 continue;
             }
             int referenceCount = countTableReferences(query, name);
             if (referenceCount < 2) {
                 continue;
             }
-            candidates.add(new CteCandidate(name, SqlFormatter.formatSql(withQuery.getQuery()), referenceCount));
+            candidates.add(new CteCandidate(name, referenceCount));
         }
         return ImmutableList.copyOf(candidates);
     }
 
     /**
+     * Build the {@code AS}-source query for materializing CTE {@code cteName} into a scratch table.
+     * Dependencies already present in {@code nameToScratch} are redefined as scratch scans; the rest are
+     * inlined (their original bodies) via a WITH clause covering the CTE's transitive dependency closure.
+     * Returns just the CTE body when it has no sibling dependencies.
+     */
+    public static String buildScratchSource(Statement statement, String cteName, Map<String, String> nameToScratch, SqlParser parser)
+    {
+        Query query = (Query) statement;
+        List<WithQuery> withQueries = query.getWith().orElseThrow().getQueries();
+        Set<String> cteNames = withQueries.stream().map(CteMaterializer::cteName).collect(Collectors.toSet());
+        Map<String, WithQuery> byName = withQueries.stream()
+                .collect(Collectors.toMap(CteMaterializer::cteName, wq -> wq, (a, b) -> a, LinkedHashMap::new));
+        Map<String, Set<String>> directDeps = new HashMap<>();
+        for (WithQuery withQuery : withQueries) {
+            directDeps.put(cteName(withQuery), referencedCtes(withQuery.getQuery(), cteNames));
+        }
+
+        WithQuery target = byName.get(cteName.toLowerCase(ENGLISH));
+        Set<String> closure = new LinkedHashSet<>();
+        collectClosure(cteName.toLowerCase(ENGLISH), directDeps, closure);
+
+        // WITH entries for the dependency closure, in original declaration order
+        List<WithQuery> entries = new ArrayList<>();
+        for (WithQuery withQuery : withQueries) {
+            String name = cteName(withQuery);
+            if (!closure.contains(name)) {
+                continue;
+            }
+            String scratch = nameToScratch.get(name);
+            if (scratch != null) {
+                Query scan = (Query) parser.createStatement("SELECT * FROM " + scratch);
+                entries.add(new WithQuery(withQuery.getName(), scan, Optional.empty()));
+            }
+            else {
+                entries.add(withQuery);
+            }
+        }
+
+        Query body = target.getQuery();
+        Query source = entries.isEmpty()
+                ? body
+                : new Query(
+                        body.getSessionProperties(),
+                        body.getFunctions(),
+                        Optional.of(new With(false, entries)),
+                        body.getQueryBody(),
+                        body.getOrderBy(),
+                        body.getOffset(),
+                        body.getLimit());
+        return SqlFormatter.formatSql(source);
+    }
+
+    /**
      * Rewrite the statement, replacing each materialized CTE's body with {@code SELECT * FROM <scratch>}.
-     * {@code nameToScratch} maps lowercased CTE name to its fully-qualified scratch table name.
+     * {@code nameToScratch} maps lowercased CTE name to its fully-qualified scratch table name. CTEs absent
+     * from the map (not materialized) are left untouched.
      */
     public static Statement rewrite(Statement statement, Map<String, String> nameToScratch, SqlParser parser)
     {
@@ -104,7 +185,7 @@ public final class CteMaterializer
         With with = query.getWith().orElseThrow();
         List<WithQuery> rewritten = with.getQueries().stream()
                 .map(withQuery -> {
-                    String name = withQuery.getName().getValue().toLowerCase(ENGLISH);
+                    String name = cteName(withQuery);
                     String scratch = nameToScratch.get(name);
                     if (scratch == null) {
                         return withQuery;
@@ -117,11 +198,16 @@ public final class CteMaterializer
         return new Query(
                 query.getSessionProperties(),
                 query.getFunctions(),
-                java.util.Optional.of(newWith),
+                Optional.of(newWith),
                 query.getQueryBody(),
                 query.getOrderBy(),
                 query.getOffset(),
                 query.getLimit());
+    }
+
+    private static String cteName(WithQuery withQuery)
+    {
+        return withQuery.getName().getValue().toLowerCase(ENGLISH);
     }
 
     private static int countTableReferences(Node root, String cteName)
@@ -135,18 +221,55 @@ public final class CteMaterializer
         return count[0];
     }
 
-    private static boolean referencesAnyCte(Node root, Set<String> cteNames)
+    private static Set<String> referencedCtes(Node root, Set<String> cteNames)
     {
-        boolean[] found = {false};
+        Set<String> found = new LinkedHashSet<>();
         walk(root, node -> {
-            if (node instanceof Table table && isUnqualified(table) && cteNames.contains(table.getName().getSuffix().toLowerCase(ENGLISH))) {
-                found[0] = true;
+            if (node instanceof Table table && isUnqualified(table)) {
+                String name = table.getName().getSuffix().toLowerCase(ENGLISH);
+                if (cteNames.contains(name)) {
+                    found.add(name);
+                }
             }
         });
-        return found[0];
+        return found;
     }
 
-    private static boolean isDeterministic(Node root)
+    private static void collectClosure(String name, Map<String, Set<String>> directDeps, Set<String> out)
+    {
+        for (String dep : directDeps.getOrDefault(name, Set.of())) {
+            if (out.add(dep)) {
+                collectClosure(dep, directDeps, out);
+            }
+        }
+    }
+
+    private static boolean isDeterministicTransitively(
+            String name,
+            Map<String, WithQuery> byName,
+            Map<String, Set<String>> directDeps,
+            Map<String, Boolean> memo)
+    {
+        Boolean cached = memo.get(name);
+        if (cached != null) {
+            return cached;
+        }
+        // guard against revisiting during recursion (cycles are already excluded, but stay safe)
+        memo.put(name, true);
+        boolean result = isDeterministicBody(byName.get(name).getQuery());
+        if (result) {
+            for (String dep : directDeps.getOrDefault(name, Set.of())) {
+                if (!isDeterministicTransitively(dep, byName, directDeps, memo)) {
+                    result = false;
+                    break;
+                }
+            }
+        }
+        memo.put(name, result);
+        return result;
+    }
+
+    private static boolean isDeterministicBody(Node root)
     {
         boolean[] deterministic = {true};
         walk(root, node -> {
@@ -160,6 +283,40 @@ public final class CteMaterializer
             }
         });
         return deterministic[0];
+    }
+
+    private static boolean bodyHasWith(Query body)
+    {
+        return body.getWith().isPresent();
+    }
+
+    private static boolean hasCycle(Set<String> nodes, Map<String, Set<String>> edges)
+    {
+        Map<String, Integer> color = new HashMap<>(); // 0=visiting, 1=done
+        for (String node : nodes) {
+            if (!color.containsKey(node) && dfsHasCycle(node, edges, color)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean dfsHasCycle(String node, Map<String, Set<String>> edges, Map<String, Integer> color)
+    {
+        color.put(node, 0);
+        for (String next : edges.getOrDefault(node, Set.of())) {
+            Integer c = color.get(next);
+            if (c == null) {
+                if (dfsHasCycle(next, edges, color)) {
+                    return true;
+                }
+            }
+            else if (c == 0) {
+                return true;
+            }
+        }
+        color.put(node, 1);
+        return false;
     }
 
     private static boolean isUnqualified(Table table)
