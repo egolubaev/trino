@@ -30,6 +30,7 @@ import io.trino.cost.CachingTableStatsProvider;
 import io.trino.cost.CostCalculator;
 import io.trino.cost.StatsCalculator;
 import io.trino.cte.CteMaterializationOrchestrator;
+import io.trino.cte.CteMaterializationStrategy;
 import io.trino.cte.CteMaterializer;
 import io.trino.cte.CteMaterializer.CteCandidate;
 import io.trino.exchange.ExchangeManagerRegistry;
@@ -550,7 +551,8 @@ public class SqlQueryExecution
     private Analysis maybeMaterializeCtes()
     {
         Session session = stateMachine.getSession();
-        if (!SystemSessionProperties.isCteMaterializationEnabled(session)) {
+        CteMaterializationStrategy strategy = SystemSessionProperties.getCteMaterializationStrategy(session);
+        if (strategy == CteMaterializationStrategy.NONE) {
             return analysis;
         }
         if (session.getCatalog().isEmpty() || session.getSchema().isEmpty()) {
@@ -558,7 +560,7 @@ public class SqlQueryExecution
             return analysis;
         }
         Statement statement = preparedQuery.getStatement();
-        List<CteCandidate> candidates = CteMaterializer.findCandidates(statement);
+        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session);
         if (candidates.isEmpty()) {
             return analysis;
         }
@@ -589,6 +591,26 @@ public class SqlQueryExecution
             log.warn(e, "CTE materialization failed for query %s; falling back to inlining", stateMachine.getQueryId());
             return analysis;
         }
+    }
+
+    /**
+     * Apply the configured strategy to the set of eligible (multiply-referenced, safe) candidates.
+     * {@code ALL} keeps every eligible CTE; {@code HEURISTIC} keeps only those referenced at least
+     * {@code cte_materialization_min_references} times. (A cost-model gate will refine HEURISTIC later.)
+     */
+    private static List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session)
+    {
+        if (strategy == CteMaterializationStrategy.ALL) {
+            return eligible;
+        }
+        int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
+        ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
+        for (CteCandidate candidate : eligible) {
+            if (candidate.referenceCount() >= minReferences) {
+                selected.add(candidate);
+            }
+        }
+        return selected.build();
     }
 
     private static String scratchTableName(Session session, String cteName)

@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
+import io.trino.cte.CteMaterializationStrategy;
 import io.trino.execution.DynamicFilterConfig;
 import io.trino.execution.QueryManagerConfig;
 import io.trino.execution.TaskManagerConfig;
@@ -222,7 +223,8 @@ public final class SystemSessionProperties
     public static final String DEBUG_ADAPTIVE_PLANNER = "debug_adaptive_planner";
     public static final String SOURCE_PAGES_VALIDATION_ENABLED = "output_pages_validation_enabled";
     public static final String SPOOLING_UNSUPPORTED_WARNING = "spooling_unsupported_warning";
-    public static final String CTE_MATERIALIZATION_ENABLED = "cte_materialization_enabled";
+    public static final String CTE_MATERIALIZATION_STRATEGY = "cte_materialization_strategy";
+    public static final String CTE_MATERIALIZATION_MIN_REFERENCES = "cte_materialization_min_references";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -282,10 +284,17 @@ public final class SystemSessionProperties
                         "Determine the number of partitions based on amount of data read and processed by the query for write queries",
                         queryManagerConfig.isDeterminePartitionCountForWriteEnabled(),
                         false),
-                booleanProperty(
-                        CTE_MATERIALIZATION_ENABLED,
-                        "Materialize multiply-referenced CTEs into per-query scratch tables before executing the main query",
-                        false,
+                enumProperty(
+                        CTE_MATERIALIZATION_STRATEGY,
+                        "When to materialize multiply-referenced CTEs into per-query scratch tables: NONE (inline, default), ALL (every eligible CTE), HEURISTIC (only when reference count reaches cte_materialization_min_references)",
+                        CteMaterializationStrategy.class,
+                        CteMaterializationStrategy.NONE,
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MIN_REFERENCES,
+                        "Minimum number of references a CTE must have before the HEURISTIC strategy materializes it",
+                        2,
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MIN_REFERENCES, 2, false),
                         false),
                 integerProperty(
                         MAX_HASH_PARTITION_COUNT,
@@ -1232,9 +1241,14 @@ public final class SystemSessionProperties
         return session.getSystemProperty(REDISTRIBUTE_WRITES, Boolean.class);
     }
 
-    public static boolean isCteMaterializationEnabled(Session session)
+    public static CteMaterializationStrategy getCteMaterializationStrategy(Session session)
     {
-        return session.getSystemProperty(CTE_MATERIALIZATION_ENABLED, Boolean.class);
+        return session.getSystemProperty(CTE_MATERIALIZATION_STRATEGY, CteMaterializationStrategy.class);
+    }
+
+    public static int getCteMaterializationMinReferences(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, Integer.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)

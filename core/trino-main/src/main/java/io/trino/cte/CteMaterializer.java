@@ -57,7 +57,7 @@ public final class CteMaterializer
 
     private CteMaterializer() {}
 
-    public record CteCandidate(String name, String bodySql) {}
+    public record CteCandidate(String name, String bodySql, int referenceCount) {}
 
     public static List<CteCandidate> findCandidates(Statement statement)
     {
@@ -85,10 +85,11 @@ public final class CteMaterializer
             if (!isDeterministic(withQuery.getQuery())) {
                 continue;
             }
-            if (countTableReferences(query, name) < 2) {
+            int referenceCount = countTableReferences(query, name);
+            if (referenceCount < 2) {
                 continue;
             }
-            candidates.add(new CteCandidate(name, SqlFormatter.formatSql(withQuery.getQuery())));
+            candidates.add(new CteCandidate(name, SqlFormatter.formatSql(withQuery.getQuery()), referenceCount));
         }
         return ImmutableList.copyOf(candidates);
     }

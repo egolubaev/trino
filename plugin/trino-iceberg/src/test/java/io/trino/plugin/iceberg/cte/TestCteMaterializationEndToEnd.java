@@ -35,16 +35,18 @@ import java.util.Optional;
 
 import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
-import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_ENABLED;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_REFERENCES;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.plugin.iceberg.catalog.rest.RestCatalogTestUtils.backendCatalog;
 import static java.util.Locale.ENGLISH;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.TestInstance.Lifecycle.PER_CLASS;
 
 /**
- * End-to-end test of automatic CTE materialization (M1): a real {@code WITH x AS (...) SELECT ... x ... x}
- * query, with {@code cte_materialization_enabled=true}, is transparently rewritten by the engine to
+ * End-to-end test of automatic CTE materialization: a real {@code WITH x AS (...) SELECT ... x ... x}
+ * query, with {@code cte_materialization_strategy='ALL'}, is transparently rewritten by the engine to
  * materialize x into a per-query scratch table and read it, against an in-JVM Iceberg REST catalog.
+ * The HEURISTIC strategy's {@code cte_materialization_min_references} gate is also exercised.
  * <p>
  * This exercises the production transaction-scoping path: the parent query runs in its own autocommit
  * transaction while the child scratch CTAS commits independently and is visible to the rewritten main query.
@@ -111,7 +113,7 @@ public class TestCteMaterializationEndToEnd
         Session disabled = getSession();
         Session enabled = Session.builder(disabled)
                 .setSchema(SCHEMA)                 // scratch tables land in the session's default schema
-                .setSystemProperty(CTE_MATERIALIZATION_ENABLED, "true")
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
                 .build();
 
         MaterializedResult expected = runner.execute(disabled, query);
@@ -142,7 +144,7 @@ public class TestCteMaterializationEndToEnd
                 "WITH y AS (SELECT k FROM iceberg." + SCHEMA + ".src1) SELECT count(*) FROM y";
         Session enabled = Session.builder(getSession())
                 .setSchema(SCHEMA)
-                .setSystemProperty(CTE_MATERIALIZATION_ENABLED, "true")
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
                 .build();
 
         assertThat(runner.execute(enabled, query).getOnlyValue()).isEqualTo(3L);
@@ -153,5 +155,49 @@ public class TestCteMaterializationEndToEnd
         assertThat(materialized)
                 .as("a single-reference CTE must not be materialized")
                 .isFalse();
+    }
+
+    @Test
+    public void testHeuristicRespectsMinReferences()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".src2");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".src2 AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(k, v)");
+
+        // z is referenced exactly twice
+        @Language("SQL") String query =
+                "WITH z AS (SELECT k, v FROM iceberg." + SCHEMA + ".src2) " +
+                "SELECT a.k, b.v FROM z a JOIN z b ON a.k = b.k ORDER BY a.k";
+
+        // HEURISTIC with threshold 3: a CTE referenced only twice must NOT be materialized
+        Session belowThreshold = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, "3")
+                .build();
+        runner.execute(belowThreshold, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_z_"))
+                .as("HEURISTIC must not materialize a CTE below cte_materialization_min_references")
+                .isFalse();
+
+        // HEURISTIC with threshold 2: the same twice-referenced CTE is now materialized
+        Session atThreshold = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, "2")
+                .build();
+        runner.execute(atThreshold, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_z_"))
+                .as("HEURISTIC must materialize a CTE at/above cte_materialization_min_references")
+                .isTrue();
+    }
+
+    private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)
+    {
+        return runner.getCoordinator().getQueryManager().getQueries().stream()
+                .map(BasicQueryInfo::getQuery)
+                .anyMatch(sql -> sql.toUpperCase(ENGLISH).startsWith("CREATE TABLE")
+                        && sql.toLowerCase(ENGLISH).contains(scratchInfix));
     }
 }

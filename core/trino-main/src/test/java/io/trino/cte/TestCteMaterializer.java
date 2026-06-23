@@ -23,6 +23,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * Pure-AST unit tests for CTE materialization detection and rewrite (no server / no catalog).
@@ -38,6 +39,19 @@ public class TestCteMaterializer
                 "WITH x AS (SELECT a, sum(b) AS s FROM t GROUP BY a) " +
                 "SELECT * FROM x p JOIN x q ON p.a = q.a"));
         assertThat(candidates).extracting(CteCandidate::name).containsExactly("x");
+    }
+
+    @Test
+    public void reportsReferenceCount()
+    {
+        // x referenced twice, y referenced three times -> both eligible, counts reported for HEURISTIC gating
+        List<CteCandidate> candidates = CteMaterializer.findCandidates(parse(
+                "WITH x AS (SELECT a FROM t), y AS (SELECT a FROM u) " +
+                "SELECT * FROM x p JOIN x q ON p.a = q.a " +
+                "JOIN y r ON r.a = p.a JOIN y s ON s.a = q.a JOIN y v ON v.a = r.a"));
+        assertThat(candidates)
+                .extracting(CteCandidate::name, CteCandidate::referenceCount)
+                .containsExactlyInAnyOrder(tuple("x", 2), tuple("y", 3));
     }
 
     @Test

@@ -36,7 +36,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
-import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_ENABLED;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.execution.QueryState.FAILED;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
@@ -154,7 +154,7 @@ public class CteMaterializationOrchestrator
     {
         // run in a fresh autocommit transaction, with CTE materialization disabled to avoid recursion
         SessionContext context = SessionContext.fromSessionWithoutTransaction(parentSession)
-                .withSystemProperty(CTE_MATERIALIZATION_ENABLED, "false");
+                .withSystemProperty(CTE_MATERIALIZATION_STRATEGY, CteMaterializationStrategy.NONE.name());
         DispatchQuery query = client().execute(context, sql, DISCARD_RESULTS);
         QueryInfo info = query.getFullQueryInfo();
         if (info.getState() == FAILED) {
