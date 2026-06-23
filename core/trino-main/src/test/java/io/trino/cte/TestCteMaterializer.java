@@ -16,11 +16,13 @@ package io.trino.cte;
 import io.trino.cte.CteMaterializer.CteCandidate;
 import io.trino.sql.SqlFormatter;
 import io.trino.sql.parser.SqlParser;
+import io.trino.sql.tree.QualifiedName;
 import io.trino.sql.tree.Statement;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.tuple;
@@ -189,6 +191,23 @@ public class TestCteMaterializer
         String source = normalize(CteMaterializer.buildScratchSource(stmt, "a", Map.of(), SQL_PARSER));
         assertThat(source).doesNotContainIgnoringCase("WITH");
         assertThat(source).contains("FROM t");
+    }
+
+    @Test
+    public void sourceTablesForStandaloneCteListsBaseTables()
+    {
+        Statement stmt = parse("WITH a AS (SELECT k FROM cat.sch.t) SELECT * FROM a x JOIN a y ON x.k = y.k");
+        Optional<List<QualifiedName>> tables = CteMaterializer.sourceTablesForCostEstimate(stmt, "a");
+        assertThat(tables).isPresent();
+        assertThat(tables.get()).extracting(QualifiedName::toString).containsExactly("cat.sch.t");
+    }
+
+    @Test
+    public void sourceTablesForDependentCteIsUnknown()
+    {
+        // b depends on sibling a -> its scanned volume is not cheaply sizable -> unknown (cost gate won't prune)
+        Statement stmt = parse("WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a) SELECT * FROM b x JOIN b y ON x.k = y.k");
+        assertThat(CteMaterializer.sourceTablesForCostEstimate(stmt, "b")).isEmpty();
     }
 
     @Test

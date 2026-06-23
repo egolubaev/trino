@@ -18,6 +18,7 @@ import io.trino.sql.SqlFormatter;
 import io.trino.sql.parser.SqlParser;
 import io.trino.sql.tree.FunctionCall;
 import io.trino.sql.tree.Node;
+import io.trino.sql.tree.QualifiedName;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.Statement;
 import io.trino.sql.tree.Table;
@@ -203,6 +204,36 @@ public final class CteMaterializer
                 query.getOrderBy(),
                 query.getOffset(),
                 query.getLimit());
+    }
+
+    /**
+     * Base tables that a CTE body scans, for a stats-based cost estimate. Returns empty when the CTE
+     * references a sibling CTE — its scanned volume then depends on inlined dependencies and is treated as
+     * unknown by the caller (so the cost gate does not prune it). Otherwise returns every table name the
+     * body reads (which, with no sibling dependencies, are all real catalog tables).
+     */
+    public static Optional<List<QualifiedName>> sourceTablesForCostEstimate(Statement statement, String cteName)
+    {
+        if (!(statement instanceof Query query) || query.getWith().isEmpty()) {
+            return Optional.empty();
+        }
+        List<WithQuery> withQueries = query.getWith().get().getQueries();
+        Set<String> cteNames = withQueries.stream().map(CteMaterializer::cteName).collect(Collectors.toSet());
+        String target = cteName.toLowerCase(ENGLISH);
+        WithQuery withQuery = withQueries.stream().filter(wq -> cteName(wq).equals(target)).findFirst().orElse(null);
+        if (withQuery == null) {
+            return Optional.empty();
+        }
+        if (!referencedCtes(withQuery.getQuery(), cteNames).isEmpty()) {
+            return Optional.empty();
+        }
+        List<QualifiedName> tables = new ArrayList<>();
+        walk(withQuery.getQuery(), node -> {
+            if (node instanceof Table table) {
+                tables.add(table.getName());
+            }
+        });
+        return Optional.of(tables);
     }
 
     private static String cteName(WithQuery withQuery)

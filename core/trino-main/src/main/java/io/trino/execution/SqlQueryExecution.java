@@ -52,6 +52,8 @@ import io.trino.execution.scheduler.faulttolerant.StageExecutionStats;
 import io.trino.execution.scheduler.faulttolerant.TaskDescriptorStorage;
 import io.trino.execution.scheduler.policy.ExecutionPolicy;
 import io.trino.execution.warnings.WarningCollector;
+import io.trino.metadata.Metadata;
+import io.trino.metadata.QualifiedObjectName;
 import io.trino.metadata.TableHandle;
 import io.trino.node.InternalNodeManager;
 import io.trino.operator.ForScheduler;
@@ -62,6 +64,8 @@ import io.trino.server.ResultQueryInfo;
 import io.trino.server.protocol.Slug;
 import io.trino.spi.QueryId;
 import io.trino.spi.TrinoException;
+import io.trino.spi.statistics.Estimate;
+import io.trino.spi.statistics.TableStatistics;
 import io.trino.sql.PlannerContext;
 import io.trino.sql.analyzer.Analysis;
 import io.trino.sql.analyzer.Analyzer;
@@ -82,6 +86,7 @@ import io.trino.sql.planner.optimizations.AdaptivePlanOptimizer;
 import io.trino.sql.planner.optimizations.PlanOptimizer;
 import io.trino.sql.planner.plan.OutputNode;
 import io.trino.sql.tree.ExplainAnalyze;
+import io.trino.sql.tree.QualifiedName;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.Statement;
 
@@ -91,6 +96,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
@@ -107,6 +113,7 @@ import static io.trino.SystemSessionProperties.isEnableDynamicFiltering;
 import static io.trino.execution.ParameterExtractor.bindParameters;
 import static io.trino.execution.QueryState.FAILED;
 import static io.trino.execution.QueryState.PLANNING;
+import static io.trino.metadata.MetadataUtil.createQualifiedObjectName;
 import static io.trino.server.DynamicFilterService.DynamicFiltersStats;
 import static io.trino.spi.StandardErrorCode.STACK_OVERFLOW;
 import static io.trino.sql.planner.sanity.PlanSanityChecker.DISTRIBUTED_PLAN_SANITY_CHECKER;
@@ -560,7 +567,7 @@ public class SqlQueryExecution
             return analysis;
         }
         Statement statement = preparedQuery.getStatement();
-        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session);
+        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session, statement);
         if (candidates.isEmpty()) {
             return analysis;
         }
@@ -599,22 +606,70 @@ public class SqlQueryExecution
 
     /**
      * Apply the configured strategy to the set of eligible (multiply-referenced, safe) candidates.
-     * {@code ALL} keeps every eligible CTE; {@code HEURISTIC} keeps only those referenced at least
-     * {@code cte_materialization_min_references} times. (A cost-model gate will refine HEURISTIC later.)
+     * {@code ALL} keeps every eligible CTE. {@code HEURISTIC} keeps a CTE only when it is referenced at
+     * least {@code cte_materialization_min_references} times AND its estimated repeated-scan savings —
+     * {@code (referenceCount - 1) * sourceRows} — reach {@code cte_materialization_min_scan_savings}.
+     * Savings are treated as unknown (and the CTE is kept) when table statistics are unavailable or the
+     * CTE depends on another CTE, so the gate never withholds materialization on missing stats.
      */
-    private static List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session)
+    private List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session, Statement statement)
     {
         if (strategy == CteMaterializationStrategy.ALL) {
             return eligible;
         }
         int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
+        long minScanSavings = SystemSessionProperties.getCteMaterializationMinScanSavings(session);
         ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
         for (CteCandidate candidate : eligible) {
-            if (candidate.referenceCount() >= minReferences) {
-                selected.add(candidate);
+            if (candidate.referenceCount() < minReferences) {
+                continue;
             }
+            OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
+            if (sourceRows.isPresent()) {
+                double savings = (candidate.referenceCount() - 1) * sourceRows.getAsDouble();
+                if (savings < minScanSavings) {
+                    log.debug("CTE materialization: skipping %s (estimated saved scan rows %.0f < threshold %s)",
+                            candidate.name(), savings, minScanSavings);
+                    continue;
+                }
+            }
+            selected.add(candidate);
         }
         return selected.build();
+    }
+
+    /**
+     * Sum of base-table row counts scanned by a CTE body, for the HEURISTIC cost gate. Empty when the CTE
+     * depends on another CTE, when a table cannot be resolved, or when any table's row-count statistic is
+     * unknown — i.e. whenever we cannot confidently size the scan (the caller then declines to prune).
+     */
+    private OptionalDouble estimateSourceRows(Session session, Statement statement, String cteName)
+    {
+        Optional<List<QualifiedName>> tables = CteMaterializer.sourceTablesForCostEstimate(statement, cteName);
+        if (tables.isEmpty()) {
+            return OptionalDouble.empty();
+        }
+        Metadata metadata = plannerContext.getMetadata();
+        double total = 0;
+        try {
+            for (QualifiedName table : tables.get()) {
+                QualifiedObjectName name = createQualifiedObjectName(session, statement, table);
+                Optional<TableHandle> handle = metadata.getTableHandle(session, name);
+                if (handle.isEmpty()) {
+                    return OptionalDouble.empty();
+                }
+                Estimate rowCount = metadata.getTableStatistics(session, handle.get()).getRowCount();
+                if (rowCount.isUnknown()) {
+                    return OptionalDouble.empty();
+                }
+                total += rowCount.getValue();
+            }
+        }
+        catch (RuntimeException e) {
+            // any resolution/stats failure -> unknown, do not prune
+            return OptionalDouble.empty();
+        }
+        return OptionalDouble.of(total);
     }
 
     private static String scratchTableName(Session session, String cteName)

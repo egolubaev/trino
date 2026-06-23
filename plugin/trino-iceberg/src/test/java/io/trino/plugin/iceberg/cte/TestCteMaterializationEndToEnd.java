@@ -36,6 +36,7 @@ import java.util.Optional;
 import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_REFERENCES;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_SCAN_SAVINGS;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.plugin.iceberg.catalog.rest.RestCatalogTestUtils.backendCatalog;
 import static java.util.Locale.ENGLISH;
@@ -170,11 +171,13 @@ public class TestCteMaterializationEndToEnd
                 "WITH z AS (SELECT k, v FROM iceberg." + SCHEMA + ".src2) " +
                 "SELECT a.k, b.v FROM z a JOIN z b ON a.k = b.k ORDER BY a.k";
 
+        // min_scan_savings=1 isolates the reference-count gate from the cost gate (tiny source)
         // HEURISTIC with threshold 3: a CTE referenced only twice must NOT be materialized
         Session belowThreshold = Session.builder(getSession())
                 .setSchema(SCHEMA)
                 .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
                 .setSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, "3")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, "1")
                 .build();
         runner.execute(belowThreshold, query);
         assertThat(scratchSubmittedFor(runner, ".cte_z_"))
@@ -186,10 +189,46 @@ public class TestCteMaterializationEndToEnd
                 .setSchema(SCHEMA)
                 .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
                 .setSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, "2")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, "1")
                 .build();
         runner.execute(atThreshold, query);
         assertThat(scratchSubmittedFor(runner, ".cte_z_"))
                 .as("HEURISTIC must materialize a CTE at/above cte_materialization_min_references")
+                .isTrue();
+    }
+
+    @Test
+    public void testHeuristicCostGateUsesTableStatistics()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".src4");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".src4 AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(k, v)");
+
+        // w is referenced twice over a 3-row source -> savings = (2-1)*3 = 3 rows
+        @Language("SQL") String query =
+                "WITH w AS (SELECT k, v FROM iceberg." + SCHEMA + ".src4) " +
+                "SELECT a.k, b.v FROM w a JOIN w b ON a.k = b.k ORDER BY a.k";
+
+        // default savings threshold (1,000,000) >> 3 -> cost gate prunes despite reference count being met
+        Session highThreshold = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .build();
+        runner.execute(highThreshold, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_w_"))
+                .as("HEURISTIC must not materialize when estimated scan savings are below the threshold")
+                .isFalse();
+
+        // lower the threshold below the estimated savings -> now materialized
+        Session lowThreshold = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, "1")
+                .build();
+        runner.execute(lowThreshold, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_w_"))
+                .as("HEURISTIC must materialize when estimated scan savings reach the threshold")
                 .isTrue();
     }
 

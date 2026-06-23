@@ -225,6 +225,7 @@ public final class SystemSessionProperties
     public static final String SPOOLING_UNSUPPORTED_WARNING = "spooling_unsupported_warning";
     public static final String CTE_MATERIALIZATION_STRATEGY = "cte_materialization_strategy";
     public static final String CTE_MATERIALIZATION_MIN_REFERENCES = "cte_materialization_min_references";
+    public static final String CTE_MATERIALIZATION_MIN_SCAN_SAVINGS = "cte_materialization_min_scan_savings";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -295,6 +296,12 @@ public final class SystemSessionProperties
                         "Minimum number of references a CTE must have before the HEURISTIC strategy materializes it",
                         2,
                         value -> validateIntegerValue(value, CTE_MATERIALIZATION_MIN_REFERENCES, 2, false),
+                        false),
+                longProperty(
+                        CTE_MATERIALIZATION_MIN_SCAN_SAVINGS,
+                        "Under the HEURISTIC strategy, only materialize a CTE when its estimated repeated-scan savings, (references - 1) * source rows, reaches this many rows (savings are treated as unknown -> materialize when table statistics are unavailable)",
+                        1_000_000L,
+                        value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MIN_SCAN_SAVINGS),
                         false),
                 integerProperty(
                         MAX_HASH_PARTITION_COUNT,
@@ -1249,6 +1256,11 @@ public final class SystemSessionProperties
     public static int getCteMaterializationMinReferences(Session session)
     {
         return session.getSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, Integer.class);
+    }
+
+    public static long getCteMaterializationMinScanSavings(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, Long.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)
