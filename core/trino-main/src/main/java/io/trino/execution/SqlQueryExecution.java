@@ -568,6 +568,7 @@ public class SqlQueryExecution
             return analysis;
         }
         Map<String, String> nameToScratch = new LinkedHashMap<>();
+        long estimatedRowsSaved = 0;
         SqlParser parser = new SqlParser();
         try {
             // candidates are in WITH-declaration order, so a dependency's scratch table is committed
@@ -580,6 +581,7 @@ public class SqlQueryExecution
                     // (a dependent CTE that is materialized will inline this one into its scratch CTAS)
                     log.debug("CTE materialization: no scratch location for %s in query %s; inlining it",
                             candidate.name(), stateMachine.getQueryId());
+                    cteMaterializationOrchestrator.stats().cteInlinedNoLocation();
                     continue;
                 }
                 String scratchTable = scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId(), candidateIndex);
@@ -588,6 +590,11 @@ public class SqlQueryExecution
                 registerScratchCleanup(session, scratchTable);
                 cteMaterializationOrchestrator.materialize(session, scratchTable, scratchSource);
                 nameToScratch.put(candidate.name(), scratchTable);
+                // estimated repeated-scan rows avoided, summed over CTEs whose source size is known
+                OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
+                if (sourceRows.isPresent()) {
+                    estimatedRowsSaved += (long) ((candidate.referenceCount() - 1) * sourceRows.getAsDouble());
+                }
             }
             if (nameToScratch.isEmpty()) {
                 // no candidate had a usable scratch location: inline the whole statement
@@ -601,12 +608,14 @@ public class SqlQueryExecution
                     stateMachine.getWarningCollector(),
                     planOptimizersStatsCollector);
             Analysis rewrittenAnalysis = analyzer.analyze(rewritten);
+            cteMaterializationOrchestrator.stats().queryMaterialized(nameToScratch.size(), estimatedRowsSaved);
             log.info("CTE materialization: query %s materialized %s CTE(s) into scratch tables %s",
                     stateMachine.getQueryId(), nameToScratch.size(), nameToScratch.values());
             return rewrittenAnalysis;
         }
         catch (RuntimeException e) {
             // the feature must never break a query: fall back to inlining the original statement
+            cteMaterializationOrchestrator.stats().materializationFallback();
             log.warn(e, "CTE materialization failed for query %s; falling back to inlining", stateMachine.getQueryId());
             return analysis;
         }

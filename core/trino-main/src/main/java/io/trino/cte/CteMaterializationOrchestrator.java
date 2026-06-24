@@ -78,6 +78,7 @@ public class CteMaterializationOrchestrator
     private final DirectExchangeClientSupplier directExchangeClientSupplier;
     private final BlockEncodingSerde blockEncodingSerde;
     private final Map<String, String> scratchSchemaOverrides;
+    private final CteMaterializationStats stats;
     private final ExecutorService cleanupExecutor = newCachedThreadPool(daemonThreadsNamed("cte-scratch-cleanup-%s"));
 
     private volatile DirectTrinoClient directTrinoClient;
@@ -89,7 +90,8 @@ public class CteMaterializationOrchestrator
             QueryManagerConfig queryManagerConfig,
             DirectExchangeClientSupplier directExchangeClientSupplier,
             BlockEncodingSerde blockEncodingSerde,
-            CteMaterializationConfig cteMaterializationConfig)
+            CteMaterializationConfig cteMaterializationConfig,
+            CteMaterializationStats stats)
     {
         this.dispatchManagerProvider = requireNonNull(dispatchManagerProvider, "dispatchManagerProvider is null");
         this.queryManagerProvider = requireNonNull(queryManagerProvider, "queryManagerProvider is null");
@@ -97,6 +99,12 @@ public class CteMaterializationOrchestrator
         this.directExchangeClientSupplier = requireNonNull(directExchangeClientSupplier, "directExchangeClientSupplier is null");
         this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
         this.scratchSchemaOverrides = requireNonNull(cteMaterializationConfig, "cteMaterializationConfig is null").scratchSchemaOverrides();
+        this.stats = requireNonNull(stats, "stats is null");
+    }
+
+    public CteMaterializationStats stats()
+    {
+        return stats;
     }
 
     /**
@@ -156,7 +164,10 @@ public class CteMaterializationOrchestrator
     {
         requireNonNull(scratchTable, "scratchTable is null");
         requireNonNull(cteBodySql, "cteBodySql is null");
-        return run(parentSession, "CREATE TABLE " + scratchTable + " AS " + cteBodySql);
+        long start = System.nanoTime();
+        QueryId queryId = run(parentSession, "CREATE TABLE " + scratchTable + " AS " + cteBodySql);
+        stats.scratchCreated(System.nanoTime() - start);
+        return queryId;
     }
 
     /**
@@ -179,8 +190,10 @@ public class CteMaterializationOrchestrator
         cleanupExecutor.execute(() -> {
             try {
                 cleanup(parentSession, scratchTable);
+                stats.scratchDropped();
             }
             catch (RuntimeException e) {
+                stats.scratchDropFailed();
                 log.warn(e, "Failed to drop CTE scratch table %s", scratchTable);
             }
         });

@@ -227,3 +227,28 @@ Scratch tables are dropped within moments of the query finishing, so `SHOW TABLE
 To confirm that materialization happened, look in `system.runtime.queries` for the internal
 `CREATE TABLE ... cte_<name>_<index>_<query-id>` statements, or open the query in the Web UI. A materialized main
 query reads only the small scratch tables, so its input row count is far lower than the inlined run.
+
+### Metrics
+
+The coordinator exports a JMX MBean `trino.cte:name=CteMaterializationStats` with counters for monitoring
+how the feature is performing:
+
+- `QueriesMaterialized`, `CtesMaterialized` — adoption: queries that materialized at least one CTE, and
+  the total number of CTEs materialized.
+- `EstimatedRowsSaved` — summed `(references - 1) * source-rows` over materialized CTEs whose source size
+  is known; the repeated scans avoided.
+- `MaterializationFallbacks` — materialization was attempted but failed and the query fell back to
+  inlining. A healthy cluster keeps this at (or near) zero.
+- `CtesInlinedNoLocation` — eligible CTEs that were inlined because no scratch location could be
+  determined.
+- `ScratchTablesCreated`, `ScratchTablesDropped`, `ScratchDropFailures`, `ScratchCtasTime` — scratch
+  lifecycle and the wall time of the scratch `CREATE TABLE`s.
+- `OrphanScratchDropped`, `SweepRuns`, `SweepErrors` — orphan-sweeper activity.
+
+Query the MBean through the [JMX connector](/connector/jmx), for example:
+
+```sql
+SELECT "queriesmaterialized.totalcount", "ctesmaterialized.totalcount",
+       "estimatedrowssaved.totalcount", "materializationfallbacks.totalcount"
+FROM jmx.current."trino.cte:name=ctematerializationstats"
+```

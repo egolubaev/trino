@@ -138,8 +138,10 @@ public class CteScratchSweeper
     {
         try {
             sweep(Instant.now());
+            orchestrator.stats().sweepCompleted();
         }
         catch (Throwable t) {
+            orchestrator.stats().sweepFailed();
             log.error(t, "CTE orphan-scratch sweep failed");
         }
     }
@@ -175,6 +177,7 @@ public class CteScratchSweeper
                 String fullName = table.catalogName() + "." + table.schemaName() + "." + table.objectName();
                 try {
                     orchestrator.cleanup(internalSession(), fullName);
+                    orchestrator.stats().orphanDropped();
                     log.info("CTE orphan sweep: dropped leaked scratch table %s", fullName);
                 }
                 catch (RuntimeException e) {
