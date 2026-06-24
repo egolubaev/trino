@@ -239,6 +239,41 @@ public class TestCteMaterializer
         assertThat(sql).doesNotContain("GROUP BY");
     }
 
+    @Test
+    public void firstQualifiedTableForCteUsesCteOwnSource()
+    {
+        // x reads iceberg, y reads clickhouse -> each CTE's scratch should follow its own source catalog
+        Statement statement = parse(
+                "WITH x AS (SELECT a, sum(b) s FROM iceberg.bench.t GROUP BY a), " +
+                "     y AS (SELECT a, count(*) c FROM clickhouse.raw.u GROUP BY a) " +
+                "SELECT * FROM x j1 JOIN x j2 ON j1.a = j2.a JOIN y k1 ON k1.a = j1.a JOIN y k2 ON k2.a = j2.a");
+        assertThat(CteMaterializer.firstQualifiedTableForCte(statement, "x"))
+                .map(QualifiedName::toString).contains("iceberg.bench.t");
+        assertThat(CteMaterializer.firstQualifiedTableForCte(statement, "y"))
+                .map(QualifiedName::toString).contains("clickhouse.raw.u");
+    }
+
+    @Test
+    public void firstQualifiedTableForCteFollowsDependencyClosure()
+    {
+        // y has no base table of its own; it reads dependency x, whose source catalog must be discovered
+        Statement statement = parse(
+                "WITH x AS (SELECT a, b FROM clickhouse.raw.u), " +
+                "     y AS (SELECT a, sum(b) s FROM x GROUP BY a) " +
+                "SELECT * FROM y p JOIN y q ON p.a = q.a");
+        assertThat(CteMaterializer.firstQualifiedTableForCte(statement, "y"))
+                .map(QualifiedName::toString).contains("clickhouse.raw.u");
+    }
+
+    @Test
+    public void firstQualifiedTableForCteEmptyWhenUnqualified()
+    {
+        // unqualified source resolves through the session default -> no catalog derivable from the AST
+        Statement statement = parse(
+                "WITH x AS (SELECT a, sum(b) s FROM t GROUP BY a) SELECT * FROM x p JOIN x q ON p.a = q.a");
+        assertThat(CteMaterializer.firstQualifiedTableForCte(statement, "x")).isEmpty();
+    }
+
     private static Statement parse(String sql)
     {
         return SQL_PARSER.createStatement(sql);

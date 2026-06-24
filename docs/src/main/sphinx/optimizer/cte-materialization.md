@@ -38,17 +38,29 @@ For an eligible CTE, before the main query is planned:
 If anything fails along the way, the query transparently falls back to normal inlining — materialization
 never changes a query's result or causes it to fail.
 
+The scratch `CREATE TABLE` runs as an internal query that **bypasses resource-group admission control**.
+The parent query has already been admitted and is occupying a slot in its resource group while it plans;
+routing the scratch query through the same group could make it queue behind the group's concurrency limit
+while the parent blocks waiting for it, deadlocking the parent. The internal query therefore skips
+group selection and queueing and starts immediately. It still goes through normal memory accounting and
+worker scheduling, so it cannot exceed cluster memory limits — only queue admission is skipped.
+
 CTEs that reference earlier CTEs are supported: dependencies are materialized first (in declaration
 order) and the dependent CTE's scratch query reads their scratch tables; dependencies that were not
 themselves materialized are inlined into the dependent CTE's scratch query.
 
 ## Session properties
 
+Each of the following session properties takes its cluster-wide default from the matching configuration
+property (`cte-materialization.strategy`, `cte-materialization.min-references`,
+`cte-materialization.min-scan-savings`), so the feature can be enabled for all queries from
+`config.properties`; `SET SESSION` overrides the default per query.
+
 ### `cte_materialization_strategy`
 
 - **Type:** {ref}`prop-type-string`
 - **Allowed values:** `NONE`, `ALL`, `HEURISTIC`
-- **Default value:** `NONE`
+- **Default value:** `NONE` (cluster default: `cte-materialization.strategy`)
 
 Controls when an eligible, multiply-referenced CTE is materialized.
 
@@ -62,14 +74,14 @@ Controls when an eligible, multiply-referenced CTE is materialized.
 
 - **Type:** {ref}`prop-type-integer`
 - **Minimum value:** `2`
-- **Default value:** `2`
+- **Default value:** `2` (cluster default: `cte-materialization.min-references`)
 
 Under `HEURISTIC`, the minimum number of references a CTE must have before it is materialized.
 
 ### `cte_materialization_min_scan_savings`
 
 - **Type:** {ref}`prop-type-integer`
-- **Default value:** `1000000`
+- **Default value:** `1000000` (cluster default: `cte-materialization.min-scan-savings`)
 
 Under `HEURISTIC`, the minimum estimated repeated-scan savings, in rows, before a CTE is materialized.
 The estimate is `(references - 1) * source-rows`, where `source-rows` is the sum of the row counts of
@@ -80,7 +92,48 @@ is small.
 
 ## Configuration properties
 
-These cluster-level properties control the background sweeper that reclaims scratch tables leaked by a
+### `cte-materialization.strategy`
+
+- **Type:** {ref}`prop-type-string`
+- **Allowed values:** `NONE`, `ALL`, `HEURISTIC`
+- **Default value:** `NONE`
+
+Cluster-wide default for the `cte_materialization_strategy` session property. Set this in
+`config.properties` to enable materialization for all queries; individual queries can still override it
+with `SET SESSION`.
+
+### `cte-materialization.min-references`
+
+- **Type:** {ref}`prop-type-integer`
+- **Minimum value:** `2`
+- **Default value:** `2`
+
+Cluster-wide default for `cte_materialization_min_references`.
+
+### `cte-materialization.min-scan-savings`
+
+- **Type:** {ref}`prop-type-integer`
+- **Default value:** `1000000`
+
+Cluster-wide default for `cte_materialization_min_scan_savings`.
+
+### `cte-materialization.scratch-schemas`
+
+- **Type:** {ref}`prop-type-string`
+- **Default value:** (empty)
+
+Comma-separated `sourceCatalog:targetCatalog.targetSchema` entries that redirect where a CTE is
+materialized, based on the catalog its data comes from. For example
+`lakehouse:lakehouse.temp_cte,clickhouse:clickhouse.scratch` materializes CTEs that read the `lakehouse`
+catalog into `lakehouse.temp_cte` and CTEs that read `clickhouse` into `clickhouse.scratch`. A catalog
+with no entry materializes into the source table's own schema (see [Scratch table
+placement](#scratch-table-placement)). Configuring a dedicated temp schema per catalog keeps scratch
+tables out of your data schemas and gives the [orphan sweeper](cte-materialization-sweeper) a single,
+known set of schemas to watch.
+
+### Orphan sweeper
+
+The remaining properties control the background sweeper that reclaims scratch tables leaked by a
 coordinator crash or a failed cleanup. They are unrelated to whether materialization happens.
 
 ### `cte-materialization.orphan-sweep.schemas`
@@ -109,15 +162,27 @@ see [Orphan scratch sweeper](cte-materialization-sweeper) below.
 
 ## Scratch table placement
 
-Scratch tables are created in:
+A CTE's scratch table is placed in the **same catalog as the data the CTE reads**, so a CTE that reads a
+non-Iceberg catalog is never materialized into Iceberg (and vice versa). Each materialized CTE is placed
+independently, so a query whose CTEs read different catalogs materializes each one into its own catalog.
 
-1. the session's default catalog and schema, when both are set; otherwise
-2. the catalog and schema of the first fully-qualified (`catalog.schema.table`) source table the
-   statement reads.
+For each CTE, the catalog and schema are chosen as follows:
 
-If neither can be determined (no default schema and no fully-qualified source table), the query is
-inlined. The target catalog must be writable; if it is read-only (for example a TPC-H catalog used as a
-source) the scratch `CREATE TABLE` fails and the query falls back to inlining.
+1. The catalog and schema of the CTE's first fully-qualified (`catalog.schema.table`) source table,
+   following the CTE's dependency closure into the CTEs it reads. (Cross-catalog queries must qualify
+   their tables, so this reliably identifies the source catalog.)
+2. Otherwise, the session's default catalog and schema, when both are set (the common case where tables
+   are referenced unqualified).
+3. Otherwise, the catalog and schema of any fully-qualified source table in the statement.
+
+The catalog determined above is then redirected to its configured
+[`cte-materialization.scratch-schemas`](#cte-materializationscratch-schemas) target, if one is set, so
+scratch tables land in a dedicated temp schema rather than next to the source data.
+
+If no location can be determined for a CTE (no qualified source and no default schema), that CTE is
+inlined; other CTEs in the same query can still be materialized. The target catalog must be writable; if
+it is read-only (for example a TPC-H catalog used as a source) the scratch `CREATE TABLE` fails and that
+CTE falls back to inlining.
 
 ## Eligibility and limitations
 

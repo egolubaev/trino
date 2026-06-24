@@ -567,26 +567,30 @@ public class SqlQueryExecution
         if (candidates.isEmpty()) {
             return analysis;
         }
-        Optional<String> scratchSchema = scratchSchemaPrefix(session, statement);
-        if (scratchSchema.isEmpty()) {
-            // nowhere to put scratch tables: no default catalog.schema and no fully-qualified source table
-            log.debug("CTE materialization: query %s has eligible CTEs but no scratch location (set a default schema); inlining",
-                    stateMachine.getQueryId());
-            return analysis;
-        }
-
         Map<String, String> nameToScratch = new LinkedHashMap<>();
         SqlParser parser = new SqlParser();
         try {
             // candidates are in WITH-declaration order, so a dependency's scratch table is committed
             // before any CTE that reads it; buildScratchSource resolves inner references against nameToScratch
             for (CteCandidate candidate : candidates) {
+                Optional<String> scratchSchema = scratchSchemaForCte(session, statement, candidate.name());
+                if (scratchSchema.isEmpty()) {
+                    // no scratch location for this CTE (no qualified source and no default schema): inline it
+                    // (a dependent CTE that is materialized will inline this one into its scratch CTAS)
+                    log.debug("CTE materialization: no scratch location for %s in query %s; inlining it",
+                            candidate.name(), stateMachine.getQueryId());
+                    continue;
+                }
                 String scratchTable = scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId());
                 String scratchSource = CteMaterializer.buildScratchSource(statement, candidate.name(), nameToScratch, parser);
                 // register cleanup before running so a later failure still drops this table
                 registerScratchCleanup(session, scratchTable);
                 cteMaterializationOrchestrator.materialize(session, scratchTable, scratchSource);
                 nameToScratch.put(candidate.name(), scratchTable);
+            }
+            if (nameToScratch.isEmpty()) {
+                // no candidate had a usable scratch location: inline the whole statement
+                return analysis;
             }
             Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, parser);
             Analyzer analyzer = analyzerFactory.createAnalyzer(
@@ -676,18 +680,29 @@ public class SqlQueryExecution
     }
 
     /**
-     * Catalog.schema in which to create scratch tables: the session's default catalog+schema when both are
-     * set, otherwise the catalog+schema of a fully-qualified source table in the statement (so the feature
-     * works even when the client connects without a default schema, e.g. some JDBC tools). Empty when no
-     * location can be determined.
+     * Catalog.schema in which to create the scratch table for one CTE. The scratch table is placed in the
+     * same catalog as the data the CTE reads — its first fully-qualified ({@code catalog.schema.table})
+     * source table — so a CTE reading a non-Iceberg catalog is not materialized into Iceberg. When the CTE
+     * references no qualified table (everything resolves through the session default), the session's default
+     * catalog+schema is used; failing that, any fully-qualified source table in the statement. The resulting
+     * source catalog is then redirected to its configured {@code cte-materialization.scratch-schemas} target
+     * (e.g. a dedicated {@code temp_cte} schema) when one is set. Empty when no location can be determined.
      */
-    private static Optional<String> scratchSchemaPrefix(Session session, Statement statement)
+    private Optional<String> scratchSchemaForCte(Session session, Statement statement, String cteName)
     {
-        if (session.getCatalog().isPresent() && session.getSchema().isPresent()) {
-            return Optional.of(session.getCatalog().get() + "." + session.getSchema().get());
-        }
-        return CteMaterializer.firstQualifiedTable(statement)
+        Optional<String> sourceCatalogSchema = CteMaterializer.firstQualifiedTableForCte(statement, cteName)
                 .map(name -> name.getParts().get(0) + "." + name.getParts().get(1));
+        if (sourceCatalogSchema.isEmpty() && session.getCatalog().isPresent() && session.getSchema().isPresent()) {
+            sourceCatalogSchema = Optional.of(session.getCatalog().get() + "." + session.getSchema().get());
+        }
+        if (sourceCatalogSchema.isEmpty()) {
+            sourceCatalogSchema = CteMaterializer.firstQualifiedTable(statement)
+                    .map(name -> name.getParts().get(0) + "." + name.getParts().get(1));
+        }
+        return sourceCatalogSchema.map(catalogSchema -> {
+            String sourceCatalog = catalogSchema.substring(0, catalogSchema.indexOf('.'));
+            return cteMaterializationOrchestrator.scratchSchemaOverride(sourceCatalog).orElse(catalogSchema);
+        });
     }
 
     private static String scratchTableName(String scratchSchema, String cteName, String queryId)

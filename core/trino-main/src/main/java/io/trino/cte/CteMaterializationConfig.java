@@ -14,6 +14,7 @@
 package io.trino.cte;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.ConfigDescription;
 import io.airlift.units.Duration;
@@ -22,7 +23,10 @@ import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 
 import java.util.List;
+import java.util.Map;
 
+import static com.google.common.base.Strings.isNullOrEmpty;
+import static java.util.Locale.ENGLISH;
 import static java.util.concurrent.TimeUnit.HOURS;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
@@ -42,6 +46,8 @@ public class CteMaterializationConfig
     private CteMaterializationStrategy strategy = CteMaterializationStrategy.NONE;
     private int minReferences = 2;
     private long minScanSavings = 1_000_000;
+
+    private List<String> scratchSchemas = ImmutableList.of();
 
     private List<String> orphanSweepSchemas = ImmutableList.of();
     private Duration orphanSweepInterval = new Duration(10, MINUTES);
@@ -87,6 +93,44 @@ public class CteMaterializationConfig
     {
         this.minScanSavings = minScanSavings;
         return this;
+    }
+
+    public List<String> getScratchSchemas()
+    {
+        return scratchSchemas;
+    }
+
+    @Config("cte-materialization.scratch-schemas")
+    @ConfigDescription("Comma-separated sourceCatalog:targetCatalog.targetSchema overrides choosing where a CTE reading a given catalog is materialized; catalogs without an entry materialize into the source table's own schema")
+    public CteMaterializationConfig setScratchSchemas(List<String> scratchSchemas)
+    {
+        this.scratchSchemas = ImmutableList.copyOf(scratchSchemas);
+        return this;
+    }
+
+    /**
+     * Parsed {@link #getScratchSchemas()} as sourceCatalog -&gt; targetCatalog.targetSchema. The source catalog
+     * is lower-cased (catalog names are case-insensitive); the target is kept verbatim. Malformed entries
+     * (missing {@code :} or a target that is not {@code catalog.schema}) are ignored.
+     */
+    public Map<String, String> scratchSchemaOverrides()
+    {
+        ImmutableMap.Builder<String, String> overrides = ImmutableMap.builder();
+        for (String entry : scratchSchemas) {
+            int colon = entry.indexOf(':');
+            if (colon <= 0 || colon == entry.length() - 1) {
+                continue;
+            }
+            String sourceCatalog = entry.substring(0, colon).trim().toLowerCase(ENGLISH);
+            String target = entry.substring(colon + 1).trim();
+            // target must be catalog.schema (two non-empty parts)
+            int dot = target.indexOf('.');
+            if (isNullOrEmpty(sourceCatalog) || dot <= 0 || dot == target.length() - 1) {
+                continue;
+            }
+            overrides.put(sourceCatalog, target);
+        }
+        return overrides.buildKeepingLast();
     }
 
     public List<String> getOrphanSweepSchemas()

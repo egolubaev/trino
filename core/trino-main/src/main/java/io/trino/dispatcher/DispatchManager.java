@@ -42,6 +42,7 @@ import io.trino.server.SessionSupplier;
 import io.trino.server.protocol.Slug;
 import io.trino.spi.QueryId;
 import io.trino.spi.TrinoException;
+import io.trino.spi.resourcegroups.ResourceGroupId;
 import io.trino.spi.resourcegroups.SelectionContext;
 import io.trino.spi.resourcegroups.SelectionCriteria;
 import io.trino.spi.security.Identity;
@@ -74,6 +75,10 @@ import static java.util.concurrent.TimeUnit.SECONDS;
 public class DispatchManager
 {
     private static final Logger log = Logger.get(DispatchManager.class);
+
+    // synthetic resource group for internal queries that bypass admission control; never created in the
+    // resource-group tree (submit() is skipped), so it only labels the query in QueryInfo.
+    private static final ResourceGroupId INTERNAL_RESOURCE_GROUP_ID = new ResourceGroupId("_internal");
 
     private final QueryIdGenerator queryIdGenerator;
     private final QueryPreparer queryPreparer;
@@ -174,6 +179,19 @@ public class DispatchManager
 
     public ListenableFuture<Void> createQuery(QueryId queryId, Span querySpan, Slug slug, SessionContext sessionContext, String query)
     {
+        return createQuery(queryId, querySpan, slug, sessionContext, query, false);
+    }
+
+    /**
+     * @param bypassResourceGroupAdmission when {@code true}, the query skips resource-group selection and
+     * admission control and is started immediately. Used for internal queries (e.g. CTE-materialization
+     * scratch CTAS/DROP) issued while a parent query is already running: routing such a child through the
+     * parent's resource group would let it queue behind the group's concurrency limit while the parent
+     * blocks waiting for it, deadlocking. The child still goes through normal memory accounting and worker
+     * scheduling; only admission/queueing is skipped.
+     */
+    public ListenableFuture<Void> createQuery(QueryId queryId, Span querySpan, Slug slug, SessionContext sessionContext, String query, boolean bypassResourceGroupAdmission)
+    {
         requireNonNull(queryId, "queryId is null");
         requireNonNull(querySpan, "querySpan is null");
         requireNonNull(sessionContext, "sessionContext is null");
@@ -191,7 +209,7 @@ public class DispatchManager
                     .setParent(Context.current().with(querySpan))
                     .startSpan();
             try (var _ = scopedSpan(span)) {
-                createQueryInternal(queryId, querySpan, slug, sessionContext, query, resourceGroupManager);
+                createQueryInternal(queryId, querySpan, slug, sessionContext, query, resourceGroupManager, bypassResourceGroupAdmission);
             }
             finally {
                 queryCreationFuture.set(null);
@@ -204,7 +222,7 @@ public class DispatchManager
      * Creates and registers a dispatch query with the query tracker.  This method will never fail to register a query with the query
      * tracker.  If an error occurs while creating a dispatch query, a failed dispatch will be created and registered.
      */
-    private <C> void createQueryInternal(QueryId queryId, Span querySpan, Slug slug, SessionContext sessionContext, String query, ResourceGroupManager<C> resourceGroupManager)
+    private <C> void createQueryInternal(QueryId queryId, Span querySpan, Slug slug, SessionContext sessionContext, String query, ResourceGroupManager<C> resourceGroupManager, boolean bypassResourceGroupAdmission)
     {
         Session session = null;
         PreparedQuery preparedQuery = null;
@@ -224,22 +242,30 @@ public class DispatchManager
             // prepare query
             preparedQuery = queryPreparer.prepareQuery(session, query);
 
-            // select resource group
+            // select resource group (skipped for internal queries that bypass admission control)
             Optional<String> queryType = getQueryType(preparedQuery.getStatement()).map(Enum::name);
-            SelectionContext<C> selectionContext = resourceGroupManager.selectGroup(new SelectionCriteria(
-                    sessionContext.getIdentity().getPrincipal().isPresent(),
-                    sessionContext.getIdentity().getUser(),
-                    sessionContext.getIdentity().getGroups(),
-                    sessionContext.getOriginalIdentity().getUser(),
-                    sessionContext.getAuthenticatedIdentity().map(Identity::getUser),
-                    sessionContext.getSource(),
-                    sessionContext.getClientTags(),
-                    sessionContext.getResourceEstimates(),
-                    query,
-                    queryType));
+            SelectionContext<C> selectionContext = null;
+            ResourceGroupId resourceGroupId;
+            if (bypassResourceGroupAdmission) {
+                resourceGroupId = INTERNAL_RESOURCE_GROUP_ID;
+            }
+            else {
+                selectionContext = resourceGroupManager.selectGroup(new SelectionCriteria(
+                        sessionContext.getIdentity().getPrincipal().isPresent(),
+                        sessionContext.getIdentity().getUser(),
+                        sessionContext.getIdentity().getGroups(),
+                        sessionContext.getOriginalIdentity().getUser(),
+                        sessionContext.getAuthenticatedIdentity().map(Identity::getUser),
+                        sessionContext.getSource(),
+                        sessionContext.getClientTags(),
+                        sessionContext.getResourceEstimates(),
+                        query,
+                        queryType));
+                resourceGroupId = selectionContext.getResourceGroupId();
+            }
 
             // apply system default session properties (does not override user set properties)
-            session = sessionPropertyDefaults.newSessionWithDefaultProperties(session, queryType, selectionContext.getResourceGroupId());
+            session = sessionPropertyDefaults.newSessionWithDefaultProperties(session, queryType, resourceGroupId);
 
             DispatchQuery dispatchQuery = dispatchQueryFactory.createDispatchQuery(
                     session,
@@ -247,12 +273,18 @@ public class DispatchManager
                     query,
                     preparedQuery,
                     slug,
-                    selectionContext.getResourceGroupId());
+                    resourceGroupId);
 
             boolean queryAdded = queryCreated(dispatchQuery);
             if (queryAdded && !dispatchQuery.isDone()) {
                 try {
-                    resourceGroupManager.submit(dispatchQuery, selectionContext, dispatchExecutor);
+                    if (bypassResourceGroupAdmission) {
+                        // skip resource-group admission entirely and start the query immediately
+                        dispatchQuery.startWaitingForResources();
+                    }
+                    else {
+                        resourceGroupManager.submit(dispatchQuery, selectionContext, dispatchExecutor);
+                    }
                 }
                 catch (Throwable e) {
                     // dispatch query has already been registered, so just fail it directly

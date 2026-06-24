@@ -25,6 +25,7 @@ import static io.airlift.configuration.testing.ConfigAssertions.assertRecordedDe
 import static io.airlift.configuration.testing.ConfigAssertions.recordDefaults;
 import static java.util.concurrent.TimeUnit.HOURS;
 import static java.util.concurrent.TimeUnit.MINUTES;
+import static org.assertj.core.api.Assertions.assertThat;
 
 public class TestCteMaterializationConfig
 {
@@ -35,6 +36,7 @@ public class TestCteMaterializationConfig
                 .setStrategy(CteMaterializationStrategy.NONE)
                 .setMinReferences(2)
                 .setMinScanSavings(1_000_000)
+                .setScratchSchemas(ImmutableList.of())
                 .setOrphanSweepSchemas(ImmutableList.of())
                 .setOrphanSweepInterval(new Duration(10, MINUTES))
                 .setOrphanSweepMinAge(new Duration(1, HOURS)));
@@ -47,6 +49,7 @@ public class TestCteMaterializationConfig
                 .put("cte-materialization.strategy", "HEURISTIC")
                 .put("cte-materialization.min-references", "3")
                 .put("cte-materialization.min-scan-savings", "50000000")
+                .put("cte-materialization.scratch-schemas", "lakehouse:lakehouse.temp_cte,clickhouse:clickhouse.tmp")
                 .put("cte-materialization.orphan-sweep.schemas", "lakehouse.scratch,hive.tmp")
                 .put("cte-materialization.orphan-sweep.interval", "5m")
                 .put("cte-materialization.orphan-sweep.min-age", "30m")
@@ -56,10 +59,28 @@ public class TestCteMaterializationConfig
                 .setStrategy(CteMaterializationStrategy.HEURISTIC)
                 .setMinReferences(3)
                 .setMinScanSavings(50_000_000)
+                .setScratchSchemas(ImmutableList.of("lakehouse:lakehouse.temp_cte", "clickhouse:clickhouse.tmp"))
                 .setOrphanSweepSchemas(ImmutableList.of("lakehouse.scratch", "hive.tmp"))
                 .setOrphanSweepInterval(new Duration(5, MINUTES))
                 .setOrphanSweepMinAge(new Duration(30, MINUTES));
 
         assertFullMapping(properties, expected);
+    }
+
+    @Test
+    public void testScratchSchemaOverridesParsing()
+    {
+        CteMaterializationConfig config = new CteMaterializationConfig()
+                .setScratchSchemas(ImmutableList.of(
+                        "lakehouse:lakehouse.temp_cte",
+                        "ClickHouse:clickhouse.tmp",   // source catalog is matched case-insensitively
+                        "bad_no_colon",                 // ignored: no ':'
+                        "x:not_qualified",              // ignored: target is not catalog.schema
+                        ":lakehouse.temp_cte",          // ignored: empty source catalog
+                        "y:"));                          // ignored: empty target
+        Map<String, String> overrides = config.scratchSchemaOverrides();
+        assertThat(overrides).containsOnly(
+                Map.entry("lakehouse", "lakehouse.temp_cte"),
+                Map.entry("clickhouse", "clickhouse.tmp"));
     }
 }

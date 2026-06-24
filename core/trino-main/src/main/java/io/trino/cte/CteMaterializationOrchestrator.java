@@ -16,6 +16,7 @@ package io.trino.cte;
 import com.google.inject.Inject;
 import com.google.inject.Provider;
 import io.airlift.log.Logger;
+import jakarta.annotation.PreDestroy;
 import io.trino.Session;
 import io.trino.client.direct.DirectTrinoClient;
 import io.trino.client.direct.DirectTrinoClient.QueryResultsListener;
@@ -33,11 +34,15 @@ import io.trino.spi.type.Type;
 import org.intellij.lang.annotations.Language;
 
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.execution.QueryState.FAILED;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.Executors.newCachedThreadPool;
 
@@ -72,6 +77,7 @@ public class CteMaterializationOrchestrator
     private final QueryManagerConfig queryManagerConfig;
     private final DirectExchangeClientSupplier directExchangeClientSupplier;
     private final BlockEncodingSerde blockEncodingSerde;
+    private final Map<String, String> scratchSchemaOverrides;
     private final ExecutorService cleanupExecutor = newCachedThreadPool(daemonThreadsNamed("cte-scratch-cleanup-%s"));
 
     private volatile DirectTrinoClient directTrinoClient;
@@ -82,13 +88,40 @@ public class CteMaterializationOrchestrator
             Provider<QueryManager> queryManagerProvider,
             QueryManagerConfig queryManagerConfig,
             DirectExchangeClientSupplier directExchangeClientSupplier,
-            BlockEncodingSerde blockEncodingSerde)
+            BlockEncodingSerde blockEncodingSerde,
+            CteMaterializationConfig cteMaterializationConfig)
     {
         this.dispatchManagerProvider = requireNonNull(dispatchManagerProvider, "dispatchManagerProvider is null");
         this.queryManagerProvider = requireNonNull(queryManagerProvider, "queryManagerProvider is null");
         this.queryManagerConfig = requireNonNull(queryManagerConfig, "queryManagerConfig is null");
         this.directExchangeClientSupplier = requireNonNull(directExchangeClientSupplier, "directExchangeClientSupplier is null");
         this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
+        this.scratchSchemaOverrides = requireNonNull(cteMaterializationConfig, "cteMaterializationConfig is null").scratchSchemaOverrides();
+    }
+
+    /**
+     * Configured {@code targetCatalog.targetSchema} in which to materialize a CTE whose source data lives in
+     * {@code sourceCatalog}, if any (from {@code cte-materialization.scratch-schemas}). Empty means place the
+     * scratch table in the source table's own catalog/schema.
+     */
+    public Optional<String> scratchSchemaOverride(String sourceCatalog)
+    {
+        return Optional.ofNullable(scratchSchemaOverrides.get(sourceCatalog.toLowerCase(ENGLISH)));
+    }
+
+    @PreDestroy
+    public void shutdown()
+    {
+        cleanupExecutor.shutdown();
+        try {
+            if (!cleanupExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
+                cleanupExecutor.shutdownNow();
+            }
+        }
+        catch (InterruptedException e) {
+            cleanupExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
     }
 
     private DirectTrinoClient client()
@@ -103,7 +136,10 @@ public class CteMaterializationOrchestrator
                             queryManagerProvider.get(),
                             queryManagerConfig,
                             directExchangeClientSupplier,
-                            blockEncodingSerde);
+                            blockEncodingSerde,
+                            // bypass resource-group admission: a scratch CTAS runs while its parent query
+                            // is already admitted, so routing it through the parent's group could deadlock
+                            true);
                     directTrinoClient = client;
                 }
             }

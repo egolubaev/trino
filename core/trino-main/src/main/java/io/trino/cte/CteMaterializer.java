@@ -251,6 +251,58 @@ public final class CteMaterializer
         return Optional.ofNullable(found[0]);
     }
 
+    /**
+     * First fully-qualified (catalog.schema.table) table that CTE {@code cteName} scans, following its
+     * dependency closure into sibling CTE bodies. Used to place the CTE's scratch table in the same catalog
+     * as the data it materializes, so a CTE reading a non-Iceberg catalog is not materialized into Iceberg.
+     * Empty when neither the CTE nor its dependencies reference a qualified table (e.g. all references
+     * resolve through the session's default catalog), in which case the caller falls back to the session
+     * default / statement-level placement.
+     */
+    public static Optional<QualifiedName> firstQualifiedTableForCte(Statement statement, String cteName)
+    {
+        if (!(statement instanceof Query query) || query.getWith().isEmpty()) {
+            return Optional.empty();
+        }
+        Map<String, WithQuery> byName = new LinkedHashMap<>();
+        for (WithQuery wq : query.getWith().get().getQueries()) {
+            byName.put(cteName(wq), wq);
+        }
+        Set<String> cteNames = byName.keySet();
+        // breadth-first closure of the target CTE plus every sibling CTE it transitively references
+        Set<String> closure = new LinkedHashSet<>();
+        List<String> worklist = new ArrayList<>();
+        closure.add(cteName.toLowerCase(ENGLISH));
+        worklist.add(cteName.toLowerCase(ENGLISH));
+        while (!worklist.isEmpty()) {
+            WithQuery current = byName.get(worklist.removeLast());
+            if (current == null) {
+                continue;
+            }
+            for (String dep : referencedCtes(current.getQuery(), cteNames)) {
+                if (closure.add(dep)) {
+                    worklist.add(dep);
+                }
+            }
+        }
+        QualifiedName[] found = {null};
+        for (String name : closure) {
+            WithQuery wq = byName.get(name);
+            if (wq == null) {
+                continue;
+            }
+            walk(wq.getQuery(), node -> {
+                if (found[0] == null && node instanceof Table table && table.getName().getParts().size() == 3) {
+                    found[0] = table.getName();
+                }
+            });
+            if (found[0] != null) {
+                break;
+            }
+        }
+        return Optional.ofNullable(found[0]);
+    }
+
     private static String cteName(WithQuery withQuery)
     {
         return withQuery.getName().getValue().toLowerCase(ENGLISH);

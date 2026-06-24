@@ -74,11 +74,30 @@ already rejected by analysis). Form 1 is cleaner and handles set operations. Bou
 - **Cost gate prunes, never blocks.** Under `HEURISTIC`, unknown statistics ⇒ materialize. The gate only
   declines when it can *prove* the repeated scan is small, so missing stats never silently disable the
   feature.
-- **Scratch placement falls back to the source table's catalog.schema** when the session has no default
-  schema (M5). This fixed a real footgun: JDBC/BI clients (DBeaver) often connect without a default
-  schema, so the feature used to silently no-op even with `strategy=ALL`. Caveat: if the only qualified
-  source is in a read-only catalog (e.g. `tpch`), the scratch CTAS fails there and the query falls back to
-  inlining. A dedicated scratch schema would remove this caveat — but see backlog (not doing).
+- **Per-CTE, source-catalog-derived scratch placement.** Each materialized CTE is placed in the **same
+  catalog as the data it reads** (its first fully-qualified source table, following the CTE's dependency
+  closure), not in the session's default catalog. This is the multi-connector fix: a CTE that reads a
+  non-Iceberg catalog (e.g. ClickHouse) must not be materialized into Iceberg. Fallbacks when the CTE has
+  no qualified source: session default catalog.schema (the common unqualified case), then any qualified
+  source table in the statement. Placement is per-CTE, so a query whose CTEs read different catalogs
+  materializes each into its own catalog; a CTE with no derivable location is inlined while others in the
+  same query are still materialized. This also fixed the original JDBC/BI footgun (DBeaver connecting
+  without a default schema → silent no-op). Caveat unchanged: a read-only source catalog (e.g. `tpch`)
+  makes that CTE's CTAS fail and fall back to inlining.
+- **Per-catalog scratch-schema override** (`cte-materialization.scratch-schemas`,
+  `sourceCatalog:targetCatalog.targetSchema`). The source catalog determined above is redirected to a
+  configured target schema when set (e.g. `lakehouse:lakehouse.temp_cte`). This is the
+  *dedicated scratch schema*, done per-catalog rather than as one global schema — necessary precisely
+  because different source catalogs need their scratch in different connectors. It keeps scratch out of
+  data schemas and gives the sweeper one known set of schemas to watch.
+- **Internal scratch CTAS/DROP bypass resource-group admission.** The scratch query runs while the parent
+  is already admitted and holding a slot in its resource group during planning; routing the child through
+  the same group risks a deadlock (child queues at the group's `hardConcurrencyLimit` while the parent
+  blocks waiting for it). The child therefore skips group selection/queueing
+  (`DispatchManager.createQuery(..., bypassResourceGroupAdmission=true)` → `startWaitingForResources()`
+  directly) and starts immediately. Memory accounting and worker scheduling are unchanged, so cluster
+  memory limits still apply — only queue admission is skipped. Rationale: if the parent is running, its
+  materialization must be able to run too.
 - **Orphan sweeper gates on query state, not existence (M6).** A still-running query's scratch is never
   dropped, regardless of age; a finished-but-leaked or unknown query's scratch is reclaimed after
   `min-age`. This keeps long-running (multi-hour) queries safe by *state* rather than relying on a large
@@ -91,11 +110,17 @@ already rejected by analysis). Form 1 is cleaner and handles set operations. Bou
 
 ## Backlog
 
+### Done (was previously "not doing")
+
+- **Dedicated scratch schema** — **reversed and implemented** as the per-catalog
+  `cte-materialization.scratch-schemas` override (see *Decisions that shaped the current design* above).
+  The original "not doing" rationale assumed a single global schema; the multi-connector requirement (a
+  ClickHouse-sourced CTE must not land in Iceberg) made a per-catalog mapping necessary, and that same
+  mapping cleanly delivers the dedicated-temp-schema benefit (sweeper target + keeping scratch out of data
+  schemas). Placement is now: source catalog (per CTE) → per-catalog override → session default.
+
 ### Not doing (explicit decisions)
 
-- **Dedicated scratch schema** (`cte_materialization_scratch_schema`). Would remove the read-only-source
-  caveat and make the sweeper target a single known schema, but adds a config/placement surface we do not
-  want. Placement stays: session default → source table.
 - **Multi-coordinator-correct sweeper.** Would need a cluster-wide query-state registry (no built-in
   mechanism — each coordinator only tracks its own queries). Staying single-coordinator; multi-coordinator
   safety is the operator's `min-age` (> longest expected query). Documented.
@@ -105,8 +130,20 @@ already rejected by analysis). Form 1 is cleaner and handles set operations. Bou
 ### Open (would do if needed)
 
 - **Column-alias CTEs** — see the limitation above; support via CTAS target column list.
-- **Resource accounting for internal queries** — the scratch CTAS/DROP run as their own queries outside
-  the parent's resource group / accounting. Assign them a resource group and attribute them to the parent.
+- **Resource *attribution* for internal queries.** Admission deadlock is solved (internal queries bypass
+  admission entirely). What remains is *accounting*: the scratch CTAS/DROP still run as their own queries,
+  so their CPU/memory is not attributed to the parent. Lower priority than the deadlock (which is fixed);
+  would attribute child cost back to the parent for monitoring/billing.
+- **Lineage of the executed main query reports scratch tables, not sources.** The rewritten query's
+  `QueryCompletedEvent` inputs are the `cte_*` scratch tables; the real source reads live in the child
+  CTAS query, so event-listener-based lineage splits across the two queries. Not a problem for
+  EXPLAIN-based lineage (`EXPLAIN` is not a `Query`, so it never materializes and shows the original
+  sources). If needed for event-listener lineage, set the main query's reported inputs from the original
+  pre-rewrite analysis. Deferred — current consumers extract lineage via EXPLAIN.
+- **Cap + parallelism for many CTEs.** No upper bound on CTEs materialized per query, and the scratch
+  CTAS run sequentially/blocking. Could add a max-per-query and run independent CTEs' CTAS in parallel
+  (dependency-ordered ones must still serialize). Parallelism is now safe to add since the admission
+  deadlock is solved.
 
 ### M7: in-engine CteProducer / CteConsumer
 
