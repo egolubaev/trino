@@ -211,6 +211,22 @@ public class TestCteMaterializer
     }
 
     @Test
+    public void firstQualifiedTableFindsThreePartName()
+    {
+        Statement stmt = parse("WITH cm AS (SELECT k FROM lakehouse.bench.src) SELECT * FROM cm a JOIN cm b ON a.k = b.k");
+        assertThat(CteMaterializer.firstQualifiedTable(stmt))
+                .map(QualifiedName::toString)
+                .contains("lakehouse.bench.src");
+    }
+
+    @Test
+    public void firstQualifiedTableEmptyWhenNoneQualified()
+    {
+        Statement stmt = parse("WITH cm AS (SELECT k FROM src) SELECT * FROM cm a JOIN cm b ON a.k = b.k");
+        assertThat(CteMaterializer.firstQualifiedTable(stmt)).isEmpty();
+    }
+
+    @Test
     public void rewriteSwapsBodyToScratchScan()
     {
         Statement original = parse(

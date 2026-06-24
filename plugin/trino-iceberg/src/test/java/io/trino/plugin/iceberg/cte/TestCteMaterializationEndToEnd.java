@@ -276,6 +276,39 @@ public class TestCteMaterializationEndToEnd
                 .isTrue();
     }
 
+    @Test
+    public void testMaterializesWithoutDefaultSchemaUsingSourceLocation()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".srcq");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".srcq AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(k, v)");
+
+        // fully-qualified source; session has NO default catalog/schema (mimics a JDBC client without USE)
+        @Language("SQL") String query =
+                "WITH cm AS (SELECT k, v FROM iceberg." + SCHEMA + ".srcq) " +
+                "SELECT a.k, b.v FROM cm a JOIN cm b ON a.k = b.k ORDER BY a.k";
+
+        Session noDefaults = Session.builder(getSession())
+                .setCatalog(Optional.empty())
+                .setSchema(Optional.empty())
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
+                .build();
+
+        MaterializedResult result = runner.execute(noDefaults, query);
+        assertThat(result.getRowCount()).isEqualTo(3);
+
+        // scratch must be created — placed in the source table's catalog.schema (iceberg.<SCHEMA>)
+        boolean placedAtSource = runner.getCoordinator().getQueryManager().getQueries().stream()
+                .map(BasicQueryInfo::getQuery)
+                .map(sql -> sql.toLowerCase(ENGLISH))
+                .anyMatch(sql -> sql.startsWith("create table")
+                        && sql.contains("iceberg." + SCHEMA.toLowerCase(ENGLISH) + ".cte_cm_"));
+        assertThat(placedAtSource)
+                .as("with no default schema, scratch should be placed in the source table's catalog.schema")
+                .isTrue();
+    }
+
     private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)
     {
         return runner.getCoordinator().getQueryManager().getQueries().stream()

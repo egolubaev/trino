@@ -236,6 +236,21 @@ public final class CteMaterializer
         return Optional.of(tables);
     }
 
+    /**
+     * First fully-qualified (catalog.schema.table) table reference in the statement, used to place scratch
+     * tables when the session has no default catalog/schema. Empty if the statement references no such table.
+     */
+    public static Optional<QualifiedName> firstQualifiedTable(Statement statement)
+    {
+        QualifiedName[] found = {null};
+        walk(statement, node -> {
+            if (found[0] == null && node instanceof Table table && table.getName().getParts().size() == 3) {
+                found[0] = table.getName();
+            }
+        });
+        return Optional.ofNullable(found[0]);
+    }
+
     private static String cteName(WithQuery withQuery)
     {
         return withQuery.getName().getValue().toLowerCase(ENGLISH);
