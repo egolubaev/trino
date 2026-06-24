@@ -13,12 +13,12 @@
  */
 package io.trino.cte;
 
-import com.google.common.base.Splitter;
 import com.google.common.collect.ImmutableList;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.ConfigDescription;
 import io.airlift.units.Duration;
 import io.airlift.units.MinDuration;
+import jakarta.validation.constraints.Min;
 import jakarta.validation.constraints.NotNull;
 
 import java.util.List;
@@ -27,18 +27,67 @@ import static java.util.concurrent.TimeUnit.HOURS;
 import static java.util.concurrent.TimeUnit.MINUTES;
 
 /**
- * Coordinator configuration for the CTE-materialization orphan-scratch sweeper. Per-query scratch tables
- * are normally dropped by a terminal-state listener, but a coordinator crash between the scratch CTAS and
- * its DROP leaks the table. When {@code cte-materialization.orphan-sweep.schemas} lists one or more
- * {@code catalog.schema} locations, a background task periodically drops {@code cte_*} tables there whose
- * originating query is no longer known to the coordinator and whose query-id timestamp is older than the
- * minimum age. Empty (the default) disables the sweeper.
+ * Cluster-wide configuration for CTE materialization.
+ * <p>
+ * The {@code strategy} / {@code min-references} / {@code min-scan-savings} properties set the cluster
+ * defaults for the matching session properties ({@code cte_materialization_strategy},
+ * {@code cte_materialization_min_references}, {@code cte_materialization_min_scan_savings}); a
+ * {@code SET SESSION} still overrides them per query.
+ * <p>
+ * The {@code orphan-sweep.*} properties configure the background sweeper that reclaims scratch tables
+ * leaked by a coordinator crash or a failed cleanup (see {@link CteScratchSweeper}).
  */
 public class CteMaterializationConfig
 {
+    private CteMaterializationStrategy strategy = CteMaterializationStrategy.NONE;
+    private int minReferences = 2;
+    private long minScanSavings = 1_000_000;
+
     private List<String> orphanSweepSchemas = ImmutableList.of();
     private Duration orphanSweepInterval = new Duration(10, MINUTES);
     private Duration orphanSweepMinAge = new Duration(1, HOURS);
+
+    @NotNull
+    public CteMaterializationStrategy getStrategy()
+    {
+        return strategy;
+    }
+
+    @Config("cte-materialization.strategy")
+    @ConfigDescription("Cluster default for cte_materialization_strategy: NONE (inline), ALL, or HEURISTIC")
+    public CteMaterializationConfig setStrategy(CteMaterializationStrategy strategy)
+    {
+        this.strategy = strategy;
+        return this;
+    }
+
+    @Min(2)
+    public int getMinReferences()
+    {
+        return minReferences;
+    }
+
+    @Config("cte-materialization.min-references")
+    @ConfigDescription("Cluster default for cte_materialization_min_references (HEURISTIC reference-count threshold)")
+    public CteMaterializationConfig setMinReferences(int minReferences)
+    {
+        this.minReferences = minReferences;
+        return this;
+    }
+
+    @Min(0)
+    public long getMinScanSavings()
+    {
+        return minScanSavings;
+    }
+
+    @Config("cte-materialization.min-scan-savings")
+    @ConfigDescription("Cluster default for cte_materialization_min_scan_savings (HEURISTIC minimum estimated repeated-scan savings, in rows)")
+    public CteMaterializationConfig setMinScanSavings(long minScanSavings)
+    {
+        this.minScanSavings = minScanSavings;
+        return this;
+    }
 
     public List<String> getOrphanSweepSchemas()
     {
@@ -47,11 +96,9 @@ public class CteMaterializationConfig
 
     @Config("cte-materialization.orphan-sweep.schemas")
     @ConfigDescription("Comma-separated catalog.schema locations to sweep for leaked CTE scratch tables (empty disables the sweeper)")
-    public CteMaterializationConfig setOrphanSweepSchemas(String schemas)
+    public CteMaterializationConfig setOrphanSweepSchemas(List<String> orphanSweepSchemas)
     {
-        this.orphanSweepSchemas = (schemas == null || schemas.isBlank())
-                ? ImmutableList.of()
-                : ImmutableList.copyOf(Splitter.on(',').trimResults().omitEmptyStrings().split(schemas));
+        this.orphanSweepSchemas = ImmutableList.copyOf(orphanSweepSchemas);
         return this;
     }
 
@@ -77,7 +124,7 @@ public class CteMaterializationConfig
     }
 
     @Config("cte-materialization.orphan-sweep.min-age")
-    @ConfigDescription("Minimum age (derived from the query-id timestamp) before a leftover scratch table is treated as an orphan; must exceed the longest expected query duration")
+    @ConfigDescription("Minimum age (from the query-id timestamp) before a leftover scratch table is treated as an orphan; must exceed the longest expected query duration")
     public CteMaterializationConfig setOrphanSweepMinAge(Duration orphanSweepMinAge)
     {
         this.orphanSweepMinAge = orphanSweepMinAge;

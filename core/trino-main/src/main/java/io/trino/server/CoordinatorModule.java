@@ -36,7 +36,6 @@ import io.trino.cost.CostComparator;
 import io.trino.cost.StatsAndCosts;
 import io.trino.cost.StatsCalculatorModule;
 import io.trino.cost.TaskCountEstimator;
-import io.trino.cte.CteMaterializationConfig;
 import io.trino.cte.CteMaterializationOrchestrator;
 import io.trino.cte.CteScratchSweeper;
 import io.trino.dispatcher.DispatchExecutor;
@@ -217,8 +216,8 @@ public class CoordinatorModule
         // dispatcher
         binder.bind(DispatchManager.class).in(Scopes.SINGLETON);
         // CTE materialization orchestrator (runs internal scratch CTAS / DROP) + orphan-scratch sweeper
+        // (CteMaterializationConfig is bound in ServerMainModule so SystemSessionProperties can use it on workers too)
         binder.bind(CteMaterializationOrchestrator.class).in(Scopes.SINGLETON);
-        configBinder(binder).bindConfig(CteMaterializationConfig.class);
         binder.bind(CteScratchSweeper.class).in(Scopes.SINGLETON);
         // WITH SESSION interpreter
         binder.bind(SessionPropertyResolver.class).in(Scopes.SINGLETON);

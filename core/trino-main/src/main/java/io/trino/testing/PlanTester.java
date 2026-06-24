@@ -62,6 +62,7 @@ import io.trino.cost.StatsCalculator;
 import io.trino.cost.StatsCalculatorModule.StatsRulesProvider;
 import io.trino.cost.StatsNormalizer;
 import io.trino.cost.TaskCountEstimator;
+import io.trino.cte.CteMaterializationConfig;
 import io.trino.eventlistener.EventListenerConfig;
 import io.trino.eventlistener.EventListenerManager;
 import io.trino.exchange.ExchangeManagerConfig;
@@ -571,7 +572,8 @@ public class PlanTester
                 optimizerConfig,
                 new NodeMemoryConfig(),
                 new DynamicFilterConfig(),
-                new NodeSchedulerConfig());
+                new NodeSchedulerConfig(),
+                new CteMaterializationConfig());
         return CatalogServiceProviderModule.createSessionPropertyManager(ImmutableSet.of(sessionProperties), connectorServicesProvider);
     }
 

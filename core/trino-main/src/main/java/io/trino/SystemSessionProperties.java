@@ -17,6 +17,7 @@ import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
+import io.trino.cte.CteMaterializationConfig;
 import io.trino.cte.CteMaterializationStrategy;
 import io.trino.execution.DynamicFilterConfig;
 import io.trino.execution.QueryManagerConfig;
@@ -239,7 +240,8 @@ public final class SystemSessionProperties
                 new OptimizerConfig(),
                 new NodeMemoryConfig(),
                 new DynamicFilterConfig(),
-                new NodeSchedulerConfig());
+                new NodeSchedulerConfig(),
+                new CteMaterializationConfig());
     }
 
     @Inject
@@ -252,7 +254,8 @@ public final class SystemSessionProperties
             OptimizerConfig optimizerConfig,
             NodeMemoryConfig nodeMemoryConfig,
             DynamicFilterConfig dynamicFilterConfig,
-            NodeSchedulerConfig nodeSchedulerConfig)
+            NodeSchedulerConfig nodeSchedulerConfig,
+            CteMaterializationConfig cteMaterializationConfig)
     {
         sessionProperties = ImmutableList.of(
                 stringProperty(
@@ -289,18 +292,18 @@ public final class SystemSessionProperties
                         CTE_MATERIALIZATION_STRATEGY,
                         "When to materialize multiply-referenced CTEs into per-query scratch tables: NONE (inline, default), ALL (every eligible CTE), HEURISTIC (only when reference count reaches cte_materialization_min_references)",
                         CteMaterializationStrategy.class,
-                        CteMaterializationStrategy.NONE,
+                        cteMaterializationConfig.getStrategy(),
                         false),
                 integerProperty(
                         CTE_MATERIALIZATION_MIN_REFERENCES,
                         "Minimum number of references a CTE must have before the HEURISTIC strategy materializes it",
-                        2,
+                        cteMaterializationConfig.getMinReferences(),
                         value -> validateIntegerValue(value, CTE_MATERIALIZATION_MIN_REFERENCES, 2, false),
                         false),
                 longProperty(
                         CTE_MATERIALIZATION_MIN_SCAN_SAVINGS,
                         "Under the HEURISTIC strategy, only materialize a CTE when its estimated repeated-scan savings, (references - 1) * source rows, reaches this many rows (savings are treated as unknown -> materialize when table statistics are unavailable)",
-                        1_000_000L,
+                        cteMaterializationConfig.getMinScanSavings(),
                         value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MIN_SCAN_SAVINGS),
                         false),
                 integerProperty(
