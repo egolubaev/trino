@@ -45,9 +45,13 @@ while the parent blocks waiting for it, deadlocking the parent. The internal que
 group selection and queueing and starts immediately. It still goes through normal memory accounting and
 worker scheduling, so it cannot exceed cluster memory limits — only queue admission is skipped.
 
-CTEs that reference earlier CTEs are supported: dependencies are materialized first (in declaration
-order) and the dependent CTE's scratch query reads their scratch tables; dependencies that were not
-themselves materialized are inlined into the dependent CTE's scratch query.
+CTEs that reference earlier CTEs are supported: dependencies are materialized first and the dependent
+CTE's scratch query reads their scratch tables; dependencies that were not themselves materialized are
+inlined into the dependent CTE's scratch query. CTEs are materialized in dependency order, and CTEs that
+do not depend on one another are materialized concurrently (up to
+`cte_materialization_max_concurrent_materializations`). At most
+`cte_materialization_max_materialized_ctes` CTEs are materialized per query; beyond that the
+least-referenced CTEs are inlined.
 
 ## Session properties
 
@@ -90,6 +94,26 @@ cannot be resolved, or the CTE depends on another CTE, the savings are treated a
 is materialized — the heuristic only ever *declines* to materialize when it can show the repeated scan
 is small.
 
+### `cte_materialization_max_materialized_ctes`
+
+- **Type:** {ref}`prop-type-integer`
+- **Minimum value:** `1`
+- **Default value:** `8` (cluster default: `cte-materialization.max-materialized-ctes`)
+
+The most CTEs a single query materializes. When more eligible CTEs qualify, the ones with the most
+references (the largest repeated-scan wins) are kept and the rest are inlined; a dropped CTE that another
+materialized CTE depends on is simply inlined into that CTE's scratch query.
+
+### `cte_materialization_max_concurrent_materializations`
+
+- **Type:** {ref}`prop-type-integer`
+- **Minimum value:** `1`
+- **Default value:** `4` (cluster default: `cte-materialization.max-concurrent-materializations`)
+
+How many independent scratch `CREATE TABLE`s a query runs at once. Independent CTEs (those that do not
+read one another) are materialized concurrently up to this limit; CTEs that depend on another materialized
+CTE still wait for it. `1` makes materialization fully sequential.
+
 ## Configuration properties
 
 ### `cte-materialization.strategy`
@@ -116,6 +140,22 @@ Cluster-wide default for `cte_materialization_min_references`.
 - **Default value:** `1000000`
 
 Cluster-wide default for `cte_materialization_min_scan_savings`.
+
+### `cte-materialization.max-materialized-ctes`
+
+- **Type:** {ref}`prop-type-integer`
+- **Minimum value:** `1`
+- **Default value:** `8`
+
+Cluster-wide default for `cte_materialization_max_materialized_ctes`.
+
+### `cte-materialization.max-concurrent-materializations`
+
+- **Type:** {ref}`prop-type-integer`
+- **Minimum value:** `1`
+- **Default value:** `4`
+
+Cluster-wide default for `cte_materialization_max_concurrent_materializations`.
 
 ### `cte-materialization.scratch-schemas`
 

@@ -33,12 +33,17 @@ import io.trino.spi.block.BlockEncodingSerde;
 import io.trino.spi.type.Type;
 import org.intellij.lang.annotations.Language;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 
+import static com.google.common.base.Preconditions.checkArgument;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.execution.QueryState.FAILED;
@@ -80,6 +85,7 @@ public class CteMaterializationOrchestrator
     private final Map<String, String> scratchSchemaOverrides;
     private final CteMaterializationStats stats;
     private final ExecutorService cleanupExecutor = newCachedThreadPool(daemonThreadsNamed("cte-scratch-cleanup-%s"));
+    private final ExecutorService materializationExecutor = newCachedThreadPool(daemonThreadsNamed("cte-materialize-%s"));
 
     private volatile DirectTrinoClient directTrinoClient;
 
@@ -120,6 +126,7 @@ public class CteMaterializationOrchestrator
     @PreDestroy
     public void shutdown()
     {
+        materializationExecutor.shutdownNow();
         cleanupExecutor.shutdown();
         try {
             if (!cleanupExecutor.awaitTermination(10, TimeUnit.SECONDS)) {
@@ -168,6 +175,69 @@ public class CteMaterializationOrchestrator
         QueryId queryId = run(parentSession, "CREATE TABLE " + scratchTable + " AS " + cteBodySql);
         stats.scratchCreated(System.nanoTime() - start);
         return queryId;
+    }
+
+    /**
+     * Materialize a batch of <b>independent</b> scratch tables (no inter-dependencies within the batch),
+     * running up to {@code maxConcurrent} CTAS at once. Blocks until all commit. If any CTAS fails, the
+     * others still settle (their committed tables are registered for the caller's terminal cleanup) and the
+     * first failure is rethrown so the caller can fall back to inlining. With a single table or
+     * {@code maxConcurrent <= 1} this is a plain sequential loop.
+     */
+    public void materializeLevel(Session parentSession, List<String> scratchTables, List<String> cteBodySqls, int maxConcurrent)
+    {
+        checkArgument(scratchTables.size() == cteBodySqls.size(), "scratchTables and cteBodySqls differ in size");
+        if (scratchTables.size() <= 1 || maxConcurrent <= 1) {
+            for (int i = 0; i < scratchTables.size(); i++) {
+                materialize(parentSession, scratchTables.get(i), cteBodySqls.get(i));
+            }
+            return;
+        }
+        Semaphore permits = new Semaphore(maxConcurrent);
+        List<Future<?>> futures = new ArrayList<>();
+        for (int i = 0; i < scratchTables.size(); i++) {
+            String scratchTable = scratchTables.get(i);
+            String cteBodySql = cteBodySqls.get(i);
+            futures.add(materializationExecutor.submit(() -> {
+                permits.acquireUninterruptibly();
+                try {
+                    materialize(parentSession, scratchTable, cteBodySql);
+                }
+                finally {
+                    permits.release();
+                }
+            }));
+        }
+        awaitAll(futures);
+    }
+
+    private static void awaitAll(List<Future<?>> futures)
+    {
+        RuntimeException failure = null;
+        for (Future<?> future : futures) {
+            try {
+                future.get();
+            }
+            catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                RuntimeException asRuntime = (cause instanceof RuntimeException re) ? re : new RuntimeException(cause);
+                if (failure == null) {
+                    failure = asRuntime;
+                }
+                else {
+                    failure.addSuppressed(asRuntime);
+                }
+            }
+            catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                if (failure == null) {
+                    failure = new RuntimeException("Interrupted while materializing CTEs", e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     /**

@@ -35,6 +35,8 @@ import java.util.Optional;
 
 import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_REFERENCES;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_SCAN_SAVINGS;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
@@ -346,6 +348,77 @@ public class TestCteMaterializationEndToEnd
         assertThat(distinctScratchCtas)
                 .as("colliding sanitized CTE names must produce two distinct scratch tables")
                 .isEqualTo(2);
+    }
+
+    @Test
+    public void testMaxMaterializedCtesCapsMaterialization()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".srccap");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".srccap AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(k, v)");
+
+        // three independent CTEs, each referenced twice; with the cap at 2 only two are materialized
+        @Language("SQL") String query =
+                "WITH p AS (SELECT k, sum(v) AS s FROM iceberg." + SCHEMA + ".srccap GROUP BY k), " +
+                "     q AS (SELECT k, sum(v) AS s FROM iceberg." + SCHEMA + ".srccap GROUP BY k), " +
+                "     r AS (SELECT k, sum(v) AS s FROM iceberg." + SCHEMA + ".srccap GROUP BY k) " +
+                "SELECT (SELECT sum(p1.s) FROM p p1 JOIN p p2 ON p1.k = p2.k), " +
+                "       (SELECT sum(q1.s) FROM q q1 JOIN q q2 ON q1.k = q2.k), " +
+                "       (SELECT sum(r1.s) FROM r r1 JOIN r r2 ON r1.k = r2.k)";
+
+        Session disabled = getSession();
+        Session capped = Session.builder(disabled)
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
+                .setSystemProperty(CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES, "2")
+                .build();
+
+        MaterializedResult expected = runner.execute(disabled, query);
+        MaterializedResult actual = runner.execute(capped, query);
+        assertThat(actual.getMaterializedRows()).isEqualTo(expected.getMaterializedRows());
+
+        long distinctScratchCtas = runner.getCoordinator().getQueryManager().getQueries().stream()
+                .map(BasicQueryInfo::getQuery)
+                .map(sql -> sql.toLowerCase(ENGLISH))
+                .filter(sql -> sql.startsWith("create table")
+                        && (sql.contains(".cte_p_") || sql.contains(".cte_q_") || sql.contains(".cte_r_")))
+                .distinct()
+                .count();
+        assertThat(distinctScratchCtas)
+                .as("cte_materialization_max_materialized_ctes=2 must materialize exactly two of the three CTEs")
+                .isEqualTo(2);
+    }
+
+    @Test
+    public void testParallelMaterializationPreservesResults()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".srcpar");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".srcpar AS " +
+                "SELECT * FROM (VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50)) t(k, v)");
+
+        // a (level 0) is read by independent b and c (level 1), which materialize concurrently
+        @Language("SQL") String query =
+                "WITH a AS (SELECT k, v FROM iceberg." + SCHEMA + ".srcpar), " +
+                "     b AS (SELECT k, sum(v) AS s FROM a GROUP BY k), " +
+                "     c AS (SELECT k, count(*) AS n FROM a GROUP BY k) " +
+                "SELECT b1.k, b1.s, c1.n FROM b b1 JOIN b b2 ON b1.k = b2.k " +
+                "JOIN c c1 ON c1.k = b1.k JOIN c c2 ON c2.k = c1.k ORDER BY b1.k";
+
+        Session disabled = getSession();
+        Session parallel = Session.builder(disabled)
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
+                .setSystemProperty(CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS, "4")
+                .build();
+
+        MaterializedResult expected = runner.execute(disabled, query);
+        MaterializedResult actual = runner.execute(parallel, query);
+        assertThat(actual.getMaterializedRows()).isEqualTo(expected.getMaterializedRows());
+        assertThat(scratchSubmittedFor(runner, ".cte_a_")).as("a materialized").isTrue();
+        assertThat(scratchSubmittedFor(runner, ".cte_b_")).as("b materialized").isTrue();
+        assertThat(scratchSubmittedFor(runner, ".cte_c_")).as("c materialized").isTrue();
     }
 
     private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)

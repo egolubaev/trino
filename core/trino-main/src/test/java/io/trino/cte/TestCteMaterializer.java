@@ -274,6 +274,54 @@ public class TestCteMaterializer
         assertThat(CteMaterializer.firstQualifiedTableForCte(statement, "x")).isEmpty();
     }
 
+    @Test
+    public void dependencyLevelsIndependentCtesSingleLevel()
+    {
+        Statement statement = parse(
+                "WITH x AS (SELECT a FROM t1), y AS (SELECT a FROM t2) SELECT * FROM x p JOIN y q ON p.a = q.a");
+        List<List<String>> levels = CteMaterializer.dependencyLevels(statement, List.of("x", "y"));
+        assertThat(levels).hasSize(1);
+        assertThat(levels.get(0)).containsExactly("x", "y");
+    }
+
+    @Test
+    public void dependencyLevelsSharedDependency()
+    {
+        // a is read by both b and c -> a on level 0, the independent b and c on level 1 (run concurrently)
+        Statement statement = parse(
+                "WITH a AS (SELECT k, v FROM t), " +
+                "     b AS (SELECT k, sum(v) AS s FROM a GROUP BY k), " +
+                "     c AS (SELECT k, count(*) AS n FROM a GROUP BY k) " +
+                "SELECT * FROM b JOIN c ON b.k = c.k");
+        List<List<String>> levels = CteMaterializer.dependencyLevels(statement, List.of("a", "b", "c"));
+        assertThat(levels).hasSize(2);
+        assertThat(levels.get(0)).containsExactly("a");
+        assertThat(levels.get(1)).containsExactly("b", "c");
+    }
+
+    @Test
+    public void dependencyLevelsLinearChain()
+    {
+        Statement statement = parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k FROM a), c AS (SELECT k FROM b) SELECT * FROM c");
+        List<List<String>> levels = CteMaterializer.dependencyLevels(statement, List.of("a", "b", "c"));
+        assertThat(levels).hasSize(3);
+        assertThat(levels.get(0)).containsExactly("a");
+        assertThat(levels.get(1)).containsExactly("b");
+        assertThat(levels.get(2)).containsExactly("c");
+    }
+
+    @Test
+    public void dependencyLevelsIgnoresNonMaterializedDependency()
+    {
+        // b reads a, but only b is being materialized -> a imposes no ordering -> b is level 0
+        Statement statement = parse(
+                "WITH a AS (SELECT k FROM t), b AS (SELECT k, sum(v) AS s FROM a GROUP BY k) SELECT * FROM b");
+        List<List<String>> levels = CteMaterializer.dependencyLevels(statement, List.of("b"));
+        assertThat(levels).hasSize(1);
+        assertThat(levels.get(0)).containsExactly("b");
+    }
+
     private static Statement parse(String sql)
     {
         return SQL_PARSER.createStatement(sql);

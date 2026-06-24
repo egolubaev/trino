@@ -91,12 +91,16 @@ import io.trino.sql.tree.Query;
 import io.trino.sql.tree.Statement;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalDouble;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
@@ -571,8 +575,9 @@ public class SqlQueryExecution
         long estimatedRowsSaved = 0;
         SqlParser parser = new SqlParser();
         try {
-            // candidates are in WITH-declaration order, so a dependency's scratch table is committed
-            // before any CTE that reads it; buildScratchSource resolves inner references against nameToScratch
+            // assign each candidate a scratch table (by source-catalog placement); candidates with no usable
+            // location are inlined. The candidate's list index keeps colliding sanitized names distinct.
+            Map<String, String> scratchTableByName = new LinkedHashMap<>();
             for (int candidateIndex = 0; candidateIndex < candidates.size(); candidateIndex++) {
                 CteCandidate candidate = candidates.get(candidateIndex);
                 Optional<String> scratchSchema = scratchSchemaForCte(session, statement, candidate.name());
@@ -584,21 +589,37 @@ public class SqlQueryExecution
                     cteMaterializationOrchestrator.stats().cteInlinedNoLocation();
                     continue;
                 }
-                String scratchTable = scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId(), candidateIndex);
-                String scratchSource = CteMaterializer.buildScratchSource(statement, candidate.name(), nameToScratch, parser);
-                // register cleanup before running so a later failure still drops this table
-                registerScratchCleanup(session, scratchTable);
-                cteMaterializationOrchestrator.materialize(session, scratchTable, scratchSource);
-                nameToScratch.put(candidate.name(), scratchTable);
+                scratchTableByName.put(candidate.name(), scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId(), candidateIndex));
                 // estimated repeated-scan rows avoided, summed over CTEs whose source size is known
                 OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
                 if (sourceRows.isPresent()) {
                     estimatedRowsSaved += (long) ((candidate.referenceCount() - 1) * sourceRows.getAsDouble());
                 }
             }
-            if (nameToScratch.isEmpty()) {
+            if (scratchTableByName.isEmpty()) {
                 // no candidate had a usable scratch location: inline the whole statement
                 return analysis;
+            }
+            // materialize by dependency level: CTEs in one level are independent and run concurrently
+            // (bounded by max_concurrent_materializations); a dependency's level commits before its dependents'.
+            int maxConcurrent = SystemSessionProperties.getCteMaterializationMaxConcurrentMaterializations(session);
+            List<String> toMaterialize = new ArrayList<>(scratchTableByName.keySet());
+            for (List<String> level : CteMaterializer.dependencyLevels(statement, toMaterialize)) {
+                List<String> levelTables = new ArrayList<>();
+                List<String> levelSources = new ArrayList<>();
+                for (String name : level) {
+                    String scratchTable = scratchTableByName.get(name);
+                    // prior levels are already in nameToScratch, so a dependent's source reads their scratch tables
+                    String scratchSource = CteMaterializer.buildScratchSource(statement, name, nameToScratch, parser);
+                    // register cleanup before running so a later failure still drops this table
+                    registerScratchCleanup(session, scratchTable);
+                    levelTables.add(scratchTable);
+                    levelSources.add(scratchSource);
+                }
+                cteMaterializationOrchestrator.materializeLevel(session, levelTables, levelSources, maxConcurrent);
+                for (int i = 0; i < level.size(); i++) {
+                    nameToScratch.put(level.get(i), levelTables.get(i));
+                }
             }
             Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, parser);
             Analyzer analyzer = analyzerFactory.createAnalyzer(
@@ -631,28 +652,62 @@ public class SqlQueryExecution
      */
     private List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session, Statement statement)
     {
+        List<CteCandidate> gated;
         if (strategy == CteMaterializationStrategy.ALL) {
-            return eligible;
+            gated = eligible;
         }
-        int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
-        long minScanSavings = SystemSessionProperties.getCteMaterializationMinScanSavings(session);
-        ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
-        for (CteCandidate candidate : eligible) {
-            if (candidate.referenceCount() < minReferences) {
-                continue;
-            }
-            OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
-            if (sourceRows.isPresent()) {
-                double savings = (candidate.referenceCount() - 1) * sourceRows.getAsDouble();
-                if (savings < minScanSavings) {
-                    log.debug("CTE materialization: skipping %s (estimated saved scan rows %.0f < threshold %s)",
-                            candidate.name(), savings, minScanSavings);
+        else {
+            int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
+            long minScanSavings = SystemSessionProperties.getCteMaterializationMinScanSavings(session);
+            ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
+            for (CteCandidate candidate : eligible) {
+                if (candidate.referenceCount() < minReferences) {
                     continue;
                 }
+                OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
+                if (sourceRows.isPresent()) {
+                    double savings = (candidate.referenceCount() - 1) * sourceRows.getAsDouble();
+                    if (savings < minScanSavings) {
+                        log.debug("CTE materialization: skipping %s (estimated saved scan rows %.0f < threshold %s)",
+                                candidate.name(), savings, minScanSavings);
+                        continue;
+                    }
+                }
+                selected.add(candidate);
             }
-            selected.add(candidate);
+            gated = selected.build();
         }
-        return selected.build();
+        return capCandidates(gated, session);
+    }
+
+    /**
+     * Cap the number of materialized CTEs at {@code cte_materialization_max_materialized_ctes}. When more
+     * candidates qualify, keep those with the most references (the largest repeated-scan wins), breaking ties
+     * by declaration order, and inline the rest. The kept candidates are returned in declaration order so the
+     * materialization loop still sees dependencies before dependents. Dropping a dependency is safe: a kept
+     * dependent simply inlines it into its own scratch CTAS.
+     */
+    private List<CteCandidate> capCandidates(List<CteCandidate> gated, Session session)
+    {
+        int cap = SystemSessionProperties.getCteMaterializationMaxMaterializedCtes(session);
+        if (gated.size() <= cap) {
+            return gated;
+        }
+        List<CteCandidate> byReferences = new ArrayList<>(gated);
+        byReferences.sort(Comparator.comparingInt(CteCandidate::referenceCount).reversed());
+        Set<String> keep = new HashSet<>();
+        for (CteCandidate candidate : byReferences.subList(0, cap)) {
+            keep.add(candidate.name());
+        }
+        log.debug("CTE materialization: capping materialized CTEs at %s of %s eligible for query %s",
+                cap, gated.size(), stateMachine.getQueryId());
+        ImmutableList.Builder<CteCandidate> capped = ImmutableList.builder();
+        for (CteCandidate candidate : gated) {
+            if (keep.contains(candidate.name())) {
+                capped.add(candidate);
+            }
+        }
+        return capped.build();
     }
 
     /**

@@ -303,6 +303,68 @@ public final class CteMaterializer
         return Optional.ofNullable(found[0]);
     }
 
+    /**
+     * Partition {@code materializedNames} (lower-cased CTE names to be materialized, in declaration order)
+     * into dependency levels: level 0 holds CTEs that depend on no other materialized CTE; level k holds
+     * CTEs whose materialized dependencies all lie in earlier levels. CTEs in the same level are independent,
+     * so their scratch CTAS can run concurrently; levels run in order so a dependency's scratch table is
+     * committed before any dependent reads it. Declaration order is preserved within each level. Only
+     * dependencies among {@code materializedNames} create ordering (a dependency that is being inlined imposes
+     * none). The WITH clause is acyclic (guaranteed by {@link #findCandidates}), so the levels are well-defined.
+     */
+    public static List<List<String>> dependencyLevels(Statement statement, List<String> materializedNames)
+    {
+        if (materializedNames.isEmpty()) {
+            return List.of();
+        }
+        if (!(statement instanceof Query query) || query.getWith().isEmpty()) {
+            return List.of(new ArrayList<>(materializedNames));
+        }
+        Map<String, WithQuery> byName = new LinkedHashMap<>();
+        for (WithQuery wq : query.getWith().get().getQueries()) {
+            byName.put(cteName(wq), wq);
+        }
+        Set<String> materialized = new LinkedHashSet<>(materializedNames);
+        Map<String, Set<String>> deps = new HashMap<>();
+        for (String name : materialized) {
+            WithQuery wq = byName.get(name);
+            Set<String> direct = wq == null ? new LinkedHashSet<>() : referencedCtes(wq.getQuery(), materialized);
+            direct.remove(name);
+            deps.put(name, direct);
+        }
+        Map<String, Integer> levelOf = new HashMap<>();
+        for (String name : materialized) {
+            computeLevel(name, deps, levelOf);
+        }
+        int maxLevel = 0;
+        for (int level : levelOf.values()) {
+            maxLevel = Math.max(maxLevel, level);
+        }
+        List<List<String>> levels = new ArrayList<>();
+        for (int i = 0; i <= maxLevel; i++) {
+            levels.add(new ArrayList<>());
+        }
+        // preserve declaration order within each level
+        for (String name : materializedNames) {
+            levels.get(levelOf.get(name)).add(name);
+        }
+        return levels;
+    }
+
+    private static int computeLevel(String name, Map<String, Set<String>> deps, Map<String, Integer> memo)
+    {
+        Integer cached = memo.get(name);
+        if (cached != null) {
+            return cached;
+        }
+        int level = 0;
+        for (String dep : deps.getOrDefault(name, Set.of())) {
+            level = Math.max(level, computeLevel(dep, deps, memo) + 1);
+        }
+        memo.put(name, level);
+        return level;
+    }
+
     private static String cteName(WithQuery withQuery)
     {
         return withQuery.getName().getValue().toLowerCase(ENGLISH);

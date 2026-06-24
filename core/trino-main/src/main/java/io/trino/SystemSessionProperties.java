@@ -227,6 +227,8 @@ public final class SystemSessionProperties
     public static final String CTE_MATERIALIZATION_STRATEGY = "cte_materialization_strategy";
     public static final String CTE_MATERIALIZATION_MIN_REFERENCES = "cte_materialization_min_references";
     public static final String CTE_MATERIALIZATION_MIN_SCAN_SAVINGS = "cte_materialization_min_scan_savings";
+    public static final String CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES = "cte_materialization_max_materialized_ctes";
+    public static final String CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS = "cte_materialization_max_concurrent_materializations";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -305,6 +307,18 @@ public final class SystemSessionProperties
                         "Under the HEURISTIC strategy, only materialize a CTE when its estimated repeated-scan savings, (references - 1) * source rows, reaches this many rows (savings are treated as unknown -> materialize when table statistics are unavailable)",
                         cteMaterializationConfig.getMinScanSavings(),
                         value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MIN_SCAN_SAVINGS),
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES,
+                        "Maximum number of CTEs materialized per query; excess eligible CTEs (fewest references first) are inlined",
+                        cteMaterializationConfig.getMaxMaterializedCtes(),
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES, 1, false),
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS,
+                        "How many independent scratch CTAS a query runs concurrently during materialization (1 = sequential)",
+                        cteMaterializationConfig.getMaxConcurrentMaterializations(),
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS, 1, false),
                         false),
                 integerProperty(
                         MAX_HASH_PARTITION_COUNT,
@@ -1264,6 +1278,16 @@ public final class SystemSessionProperties
     public static long getCteMaterializationMinScanSavings(Session session)
     {
         return session.getSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, Long.class);
+    }
+
+    public static int getCteMaterializationMaxMaterializedCtes(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES, Integer.class);
+    }
+
+    public static int getCteMaterializationMaxConcurrentMaterializations(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS, Integer.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)

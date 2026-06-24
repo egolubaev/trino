@@ -140,10 +140,15 @@ already rejected by analysis). Form 1 is cleaner and handles set operations. Bou
   EXPLAIN-based lineage (`EXPLAIN` is not a `Query`, so it never materializes and shows the original
   sources). If needed for event-listener lineage, set the main query's reported inputs from the original
   pre-rewrite analysis. Deferred — current consumers extract lineage via EXPLAIN.
-- **Cap + parallelism for many CTEs.** No upper bound on CTEs materialized per query, and the scratch
-  CTAS run sequentially/blocking. Could add a max-per-query and run independent CTEs' CTAS in parallel
-  (dependency-ordered ones must still serialize). Parallelism is now safe to add since the admission
-  deadlock is solved.
+- **[DONE] Cap + parallelism for many CTEs.** `cte_materialization_max_materialized_ctes` (config
+  `cte-materialization.max-materialized-ctes`, default 8) bounds how many CTEs a query materializes; the
+  most-referenced win, the rest are inlined (dropping a dependency is safe — a kept dependent inlines it).
+  Independent CTEs are materialized concurrently: `CteMaterializer.dependencyLevels` partitions the
+  materialized set into levels (level 0 = no materialized deps, level k = deps in earlier levels), and the
+  orchestrator runs each level's scratch CTAS in parallel up to
+  `cte_materialization_max_concurrent_materializations` (config
+  `cte-materialization.max-concurrent-materializations`, default 4; 1 = sequential). Safe now that the
+  admission deadlock (#1) is solved.
 
 ### M7: in-engine CteProducer / CteConsumer
 

@@ -46,6 +46,8 @@ public class CteMaterializationConfig
     private CteMaterializationStrategy strategy = CteMaterializationStrategy.NONE;
     private int minReferences = 2;
     private long minScanSavings = 1_000_000;
+    private int maxMaterializedCtes = 8;
+    private int maxConcurrentMaterializations = 4;
 
     private List<String> scratchSchemas = ImmutableList.of();
 
@@ -92,6 +94,34 @@ public class CteMaterializationConfig
     public CteMaterializationConfig setMinScanSavings(long minScanSavings)
     {
         this.minScanSavings = minScanSavings;
+        return this;
+    }
+
+    @Min(1)
+    public int getMaxMaterializedCtes()
+    {
+        return maxMaterializedCtes;
+    }
+
+    @Config("cte-materialization.max-materialized-ctes")
+    @ConfigDescription("Cluster default for cte_materialization_max_materialized_ctes: the most CTEs materialized per query (excess eligible CTEs, fewest references first, are inlined)")
+    public CteMaterializationConfig setMaxMaterializedCtes(int maxMaterializedCtes)
+    {
+        this.maxMaterializedCtes = maxMaterializedCtes;
+        return this;
+    }
+
+    @Min(1)
+    public int getMaxConcurrentMaterializations()
+    {
+        return maxConcurrentMaterializations;
+    }
+
+    @Config("cte-materialization.max-concurrent-materializations")
+    @ConfigDescription("Cluster default for cte_materialization_max_concurrent_materializations: how many independent scratch CTAS a query runs concurrently (1 = sequential)")
+    public CteMaterializationConfig setMaxConcurrentMaterializations(int maxConcurrentMaterializations)
+    {
+        this.maxConcurrentMaterializations = maxConcurrentMaterializations;
         return this;
     }
 
