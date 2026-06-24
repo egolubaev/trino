@@ -70,7 +70,7 @@ public class CteScratchSweeper
 {
     private static final Logger log = Logger.get(CteScratchSweeper.class);
 
-    // trailing query id in a scratch table name "cte_<name>_<YYYYMMDD_HHmmss_index_coord>"
+    // trailing query id in a scratch table name "cte_<name>_<candidateIndex>_<YYYYMMDD_HHmmss_counter_coord>"
     private static final Pattern QUERY_ID_SUFFIX = Pattern.compile("(\\d{8}_\\d{6}_\\d{5}_[0-9a-z]+)$");
     // query-id timestamps are formatted in UTC by QueryIdGenerator
     private static final DateTimeFormatter TIMESTAMP_FORMAT = DateTimeFormatter.ofPattern("yyyyMMdd_HHmmss");

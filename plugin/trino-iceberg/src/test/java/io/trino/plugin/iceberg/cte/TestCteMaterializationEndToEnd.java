@@ -309,6 +309,45 @@ public class TestCteMaterializationEndToEnd
                 .isTrue();
     }
 
+    @Test
+    public void testCollidingSanitizedCteNamesGetDistinctScratchTables()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".srcc");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".srcc AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30)) t(k, v)");
+
+        // "a-b" (quoted, hyphen) and a_b both sanitize to a_b; the candidate index must keep their scratch
+        // table names distinct, otherwise the second CTAS would collide ("table exists") and abort the whole
+        // materialization back to inlining
+        @Language("SQL") String query =
+                "WITH \"a-b\" AS (SELECT k, v FROM iceberg." + SCHEMA + ".srcc), " +
+                "     a_b AS (SELECT k, sum(v) AS s FROM iceberg." + SCHEMA + ".srcc GROUP BY k) " +
+                "SELECT t1.k, u1.s FROM \"a-b\" t1 JOIN \"a-b\" t2 ON t1.k = t2.k " +
+                "JOIN a_b u1 ON u1.k = t1.k JOIN a_b u2 ON u2.k = t1.k ORDER BY t1.k";
+
+        Session disabled = getSession();
+        Session enabled = Session.builder(disabled)
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "ALL")
+                .build();
+
+        MaterializedResult expected = runner.execute(disabled, query);
+        MaterializedResult actual = runner.execute(enabled, query);
+        assertThat(actual.getMaterializedRows()).isEqualTo(expected.getMaterializedRows());
+
+        // both colliding CTEs materialized into distinct scratch tables (cte_a_b_0_* and cte_a_b_1_*)
+        long distinctScratchCtas = runner.getCoordinator().getQueryManager().getQueries().stream()
+                .map(BasicQueryInfo::getQuery)
+                .map(sql -> sql.toLowerCase(ENGLISH))
+                .filter(sql -> sql.startsWith("create table") && sql.contains(".cte_a_b_"))
+                .distinct()
+                .count();
+        assertThat(distinctScratchCtas)
+                .as("colliding sanitized CTE names must produce two distinct scratch tables")
+                .isEqualTo(2);
+    }
+
     private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)
     {
         return runner.getCoordinator().getQueryManager().getQueries().stream()

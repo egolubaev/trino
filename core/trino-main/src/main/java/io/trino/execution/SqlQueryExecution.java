@@ -572,7 +572,8 @@ public class SqlQueryExecution
         try {
             // candidates are in WITH-declaration order, so a dependency's scratch table is committed
             // before any CTE that reads it; buildScratchSource resolves inner references against nameToScratch
-            for (CteCandidate candidate : candidates) {
+            for (int candidateIndex = 0; candidateIndex < candidates.size(); candidateIndex++) {
+                CteCandidate candidate = candidates.get(candidateIndex);
                 Optional<String> scratchSchema = scratchSchemaForCte(session, statement, candidate.name());
                 if (scratchSchema.isEmpty()) {
                     // no scratch location for this CTE (no qualified source and no default schema): inline it
@@ -581,7 +582,7 @@ public class SqlQueryExecution
                             candidate.name(), stateMachine.getQueryId());
                     continue;
                 }
-                String scratchTable = scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId());
+                String scratchTable = scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId(), candidateIndex);
                 String scratchSource = CteMaterializer.buildScratchSource(statement, candidate.name(), nameToScratch, parser);
                 // register cleanup before running so a later failure still drops this table
                 registerScratchCleanup(session, scratchTable);
@@ -705,10 +706,17 @@ public class SqlQueryExecution
         });
     }
 
-    private static String scratchTableName(String scratchSchema, String cteName, String queryId)
+    /**
+     * Scratch table name {@code cte_<sanitized-cte-name>_<candidate-index>_<query-id>}. The candidate index
+     * disambiguates CTE names that sanitize to the same string (e.g. {@code "a-b"} and {@code a_b} both
+     * become {@code a_b}); without it the second CTAS would collide ("table already exists") and abort the
+     * whole materialization. The query id stays last so the orphan sweeper can still extract it from the
+     * trailing portion of the name.
+     */
+    private static String scratchTableName(String scratchSchema, String cteName, String queryId, int candidateIndex)
     {
         String sanitized = cteName.toLowerCase(ENGLISH).replaceAll("[^a-z0-9_]", "_");
-        return scratchSchema + ".cte_" + sanitized + "_" + queryId;
+        return scratchSchema + ".cte_" + sanitized + "_" + candidateIndex + "_" + queryId;
     }
 
     private void registerScratchCleanup(Session session, String scratchTable)

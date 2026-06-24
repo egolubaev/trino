@@ -29,7 +29,7 @@ and dropped when the query terminates (the drop purges its data files through th
 
 For an eligible CTE, before the main query is planned:
 
-1. A scratch table named `cte_<cte-name>_<query-id>` is created with `CREATE TABLE ... AS <cte body>`,
+1. A scratch table named `cte_<cte-name>_<index>_<query-id>` is created with `CREATE TABLE ... AS <cte body>`,
    committed in its own autocommit transaction so it is immediately visible.
 2. The statement is rewritten so the CTE body becomes `SELECT * FROM <scratch table>` and re-analyzed.
    Predicate and projection pushdown still specialize per reference.
@@ -225,5 +225,5 @@ dropping a scratch table that another coordinator is still using.
 
 Scratch tables are dropped within moments of the query finishing, so `SHOW TABLES` rarely shows one.
 To confirm that materialization happened, look in `system.runtime.queries` for the internal
-`CREATE TABLE ... cte_<name>_<query-id>` statements, or open the query in the Web UI. A materialized main
+`CREATE TABLE ... cte_<name>_<index>_<query-id>` statements, or open the query in the Web UI. A materialized main
 query reads only the small scratch tables, so its input row count is far lower than the inlined run.
