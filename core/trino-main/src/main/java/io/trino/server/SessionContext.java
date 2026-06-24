@@ -313,4 +313,53 @@ public class SessionContext
                 session.getClientInfo(),
                 session.getQueryDataEncoding());
     }
+
+    /**
+     * Like {@link #fromSession(Session)} but with no transaction id, so a query submitted with this
+     * context runs in its own fresh autocommit transaction (rather than joining the originating
+     * query's transaction). Used to run internal statements — e.g. CTE-materialization scratch CTAS —
+     * that must commit independently and be visible to the originating query.
+     */
+    public static SessionContext fromSessionWithoutTransaction(Session session)
+    {
+        requireNonNull(session, "session is null");
+
+        Set<String> enabledRoles = session.getIdentity().getEnabledRoles();
+        SelectedRole selectedRole;
+        if (enabledRoles.isEmpty()) {
+            selectedRole = new SelectedRole(SelectedRole.Type.NONE, Optional.empty());
+        }
+        else if (enabledRoles.size() == 1) {
+            selectedRole = new SelectedRole(SelectedRole.Type.ROLE, Optional.of(enabledRoles.iterator().next()));
+        }
+        else {
+            selectedRole = new SelectedRole(SelectedRole.Type.ALL, Optional.empty());
+        }
+
+        return new SessionContext(
+                session.getProtocolHeaders(),
+                session.getCatalog(),
+                session.getSchema(),
+                Optional.of(session.getPath().getRawPath()),
+                Optional.empty(),
+                session.getIdentity(),
+                session.getOriginalIdentity(),
+                selectedRole,
+                session.getSource(),
+                session.getTraceToken(),
+                session.getUserAgent(),
+                session.getRemoteUserAddress(),
+                Optional.of(session.getTimeZoneKey().getId()),
+                Optional.of(session.getLocale().getLanguage()),
+                session.getClientTags(),
+                session.getClientCapabilities(),
+                session.getResourceEstimates(),
+                session.getSystemProperties(),
+                session.getCatalogProperties(),
+                session.getPreparedStatements(),
+                Optional.empty(),
+                session.isClientTransactionSupport(),
+                session.getClientInfo(),
+                session.getQueryDataEncoding());
+    }
 }

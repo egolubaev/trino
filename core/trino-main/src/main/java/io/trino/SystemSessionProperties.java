@@ -17,6 +17,8 @@ import com.google.common.collect.ImmutableList;
 import com.google.inject.Inject;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
+import io.trino.cte.CteMaterializationConfig;
+import io.trino.cte.CteMaterializationStrategy;
 import io.trino.execution.DynamicFilterConfig;
 import io.trino.execution.QueryManagerConfig;
 import io.trino.execution.TaskManagerConfig;
@@ -222,6 +224,11 @@ public final class SystemSessionProperties
     public static final String DEBUG_ADAPTIVE_PLANNER = "debug_adaptive_planner";
     public static final String SOURCE_PAGES_VALIDATION_ENABLED = "output_pages_validation_enabled";
     public static final String SPOOLING_UNSUPPORTED_WARNING = "spooling_unsupported_warning";
+    public static final String CTE_MATERIALIZATION_STRATEGY = "cte_materialization_strategy";
+    public static final String CTE_MATERIALIZATION_MIN_REFERENCES = "cte_materialization_min_references";
+    public static final String CTE_MATERIALIZATION_MIN_SCAN_SAVINGS = "cte_materialization_min_scan_savings";
+    public static final String CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES = "cte_materialization_max_materialized_ctes";
+    public static final String CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS = "cte_materialization_max_concurrent_materializations";
 
     private final List<PropertyMetadata<?>> sessionProperties;
 
@@ -235,7 +242,8 @@ public final class SystemSessionProperties
                 new OptimizerConfig(),
                 new NodeMemoryConfig(),
                 new DynamicFilterConfig(),
-                new NodeSchedulerConfig());
+                new NodeSchedulerConfig(),
+                new CteMaterializationConfig());
     }
 
     @Inject
@@ -248,7 +256,8 @@ public final class SystemSessionProperties
             OptimizerConfig optimizerConfig,
             NodeMemoryConfig nodeMemoryConfig,
             DynamicFilterConfig dynamicFilterConfig,
-            NodeSchedulerConfig nodeSchedulerConfig)
+            NodeSchedulerConfig nodeSchedulerConfig,
+            CteMaterializationConfig cteMaterializationConfig)
     {
         sessionProperties = ImmutableList.of(
                 stringProperty(
@@ -280,6 +289,36 @@ public final class SystemSessionProperties
                         DETERMINE_PARTITION_COUNT_FOR_WRITE_ENABLED,
                         "Determine the number of partitions based on amount of data read and processed by the query for write queries",
                         queryManagerConfig.isDeterminePartitionCountForWriteEnabled(),
+                        false),
+                enumProperty(
+                        CTE_MATERIALIZATION_STRATEGY,
+                        "When to materialize multiply-referenced CTEs into per-query scratch tables: NONE (inline, default), ALL (every eligible CTE), HEURISTIC (only when reference count reaches cte_materialization_min_references)",
+                        CteMaterializationStrategy.class,
+                        cteMaterializationConfig.getStrategy(),
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MIN_REFERENCES,
+                        "Minimum number of references a CTE must have before the HEURISTIC strategy materializes it",
+                        cteMaterializationConfig.getMinReferences(),
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MIN_REFERENCES, 2, false),
+                        false),
+                longProperty(
+                        CTE_MATERIALIZATION_MIN_SCAN_SAVINGS,
+                        "Under the HEURISTIC strategy, only materialize a CTE when its estimated repeated-scan savings, (references - 1) * source rows, reaches this many rows (savings are treated as unknown -> materialize when table statistics are unavailable)",
+                        cteMaterializationConfig.getMinScanSavings(),
+                        value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MIN_SCAN_SAVINGS),
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES,
+                        "Maximum number of CTEs materialized per query; excess eligible CTEs (fewest references first) are inlined",
+                        cteMaterializationConfig.getMaxMaterializedCtes(),
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES, 1, false),
+                        false),
+                integerProperty(
+                        CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS,
+                        "How many independent scratch CTAS a query runs concurrently during materialization (1 = sequential)",
+                        cteMaterializationConfig.getMaxConcurrentMaterializations(),
+                        value -> validateIntegerValue(value, CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS, 1, false),
                         false),
                 integerProperty(
                         MAX_HASH_PARTITION_COUNT,
@@ -1224,6 +1263,31 @@ public final class SystemSessionProperties
     public static boolean isRedistributeWrites(Session session)
     {
         return session.getSystemProperty(REDISTRIBUTE_WRITES, Boolean.class);
+    }
+
+    public static CteMaterializationStrategy getCteMaterializationStrategy(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_STRATEGY, CteMaterializationStrategy.class);
+    }
+
+    public static int getCteMaterializationMinReferences(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MIN_REFERENCES, Integer.class);
+    }
+
+    public static long getCteMaterializationMinScanSavings(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, Long.class);
+    }
+
+    public static int getCteMaterializationMaxMaterializedCtes(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES, Integer.class);
+    }
+
+    public static int getCteMaterializationMaxConcurrentMaterializations(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS, Integer.class);
     }
 
     public static boolean isUsePreferredWritePartitioning(Session session)

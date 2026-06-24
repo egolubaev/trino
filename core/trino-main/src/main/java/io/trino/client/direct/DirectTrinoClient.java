@@ -65,6 +65,7 @@ public class DirectTrinoClient
     private final BlockEncodingSerde blockEncodingSerde;
     private final long heartBeatIntervalMillis;
     private final RetryPolicy configuredRetryPolicy;
+    private final boolean bypassResourceGroupAdmission;
 
     public DirectTrinoClient(
             DispatchManager dispatchManager,
@@ -73,12 +74,30 @@ public class DirectTrinoClient
             DirectExchangeClientSupplier directExchangeClientSupplier,
             BlockEncodingSerde blockEncodingSerde)
     {
+        this(dispatchManager, queryManager, queryManagerConfig, directExchangeClientSupplier, blockEncodingSerde, false);
+    }
+
+    /**
+     * @param bypassResourceGroupAdmission when {@code true}, queries issued by this client skip resource-group
+     * admission control (see {@link DispatchManager#createQuery(QueryId, Span, Slug, SessionContext, String, boolean)}).
+     * Used by the CTE-materialization orchestrator so a scratch CTAS issued while its parent query is running
+     * cannot deadlock against the parent's resource-group concurrency limit.
+     */
+    public DirectTrinoClient(
+            DispatchManager dispatchManager,
+            QueryManager queryManager,
+            QueryManagerConfig queryManagerConfig,
+            DirectExchangeClientSupplier directExchangeClientSupplier,
+            BlockEncodingSerde blockEncodingSerde,
+            boolean bypassResourceGroupAdmission)
+    {
         this.dispatchManager = requireNonNull(dispatchManager, "dispatchManager is null");
         this.queryManager = requireNonNull(queryManager, "queryManager is null");
         this.directExchangeClientSupplier = requireNonNull(directExchangeClientSupplier, "directExchangeClientSupplier is null");
         this.blockEncodingSerde = requireNonNull(blockEncodingSerde, "blockEncodingSerde is null");
         this.heartBeatIntervalMillis = queryManagerConfig.getClientTimeout().toMillis() / 2;
         this.configuredRetryPolicy = queryManagerConfig.getRetryPolicy();
+        this.bypassResourceGroupAdmission = bypassResourceGroupAdmission;
     }
 
     public DispatchQuery execute(SessionContext sessionContext, @Language("SQL") String sql, QueryResultsListener queryResultsListener)
@@ -91,7 +110,7 @@ public class DirectTrinoClient
 
         // create the query and wait for it to be dispatched
         QueryId queryId = dispatchManager.createQueryId();
-        getQueryFuture(dispatchManager.createQuery(queryId, Span.getInvalid(), Slug.createNew(), sessionContext, sql));
+        getQueryFuture(dispatchManager.createQuery(queryId, Span.getInvalid(), Slug.createNew(), sessionContext, sql, bypassResourceGroupAdmission));
         getQueryFuture(dispatchManager.waitForDispatched(queryId));
         DispatchQuery dispatchQuery = dispatchManager.getQuery(queryId);
         if (dispatchQuery.getState().isDone()) {

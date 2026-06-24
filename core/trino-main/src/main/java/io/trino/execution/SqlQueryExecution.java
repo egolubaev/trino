@@ -18,6 +18,7 @@ import com.google.common.util.concurrent.ListenableFuture;
 import com.google.errorprone.annotations.ThreadSafe;
 import com.google.inject.Inject;
 import io.airlift.concurrent.SetThreadName;
+import io.airlift.log.Logger;
 import io.airlift.units.DataSize;
 import io.airlift.units.Duration;
 import io.opentelemetry.api.trace.Span;
@@ -28,6 +29,10 @@ import io.trino.SystemSessionProperties;
 import io.trino.cost.CachingTableStatsProvider;
 import io.trino.cost.CostCalculator;
 import io.trino.cost.StatsCalculator;
+import io.trino.cte.CteMaterializationOrchestrator;
+import io.trino.cte.CteMaterializationStrategy;
+import io.trino.cte.CteMaterializer;
+import io.trino.cte.CteMaterializer.CteCandidate;
 import io.trino.exchange.ExchangeManagerRegistry;
 import io.trino.exchange.ExchangeMetricsCollector;
 import io.trino.execution.QueryPreparer.PreparedQuery;
@@ -47,6 +52,8 @@ import io.trino.execution.scheduler.faulttolerant.StageExecutionStats;
 import io.trino.execution.scheduler.faulttolerant.TaskDescriptorStorage;
 import io.trino.execution.scheduler.policy.ExecutionPolicy;
 import io.trino.execution.warnings.WarningCollector;
+import io.trino.metadata.Metadata;
+import io.trino.metadata.QualifiedObjectName;
 import io.trino.metadata.TableHandle;
 import io.trino.node.InternalNodeManager;
 import io.trino.operator.ForScheduler;
@@ -57,12 +64,15 @@ import io.trino.server.ResultQueryInfo;
 import io.trino.server.protocol.Slug;
 import io.trino.spi.QueryId;
 import io.trino.spi.TrinoException;
+import io.trino.spi.statistics.Estimate;
+import io.trino.spi.statistics.TableStatistics;
 import io.trino.sql.PlannerContext;
 import io.trino.sql.analyzer.Analysis;
 import io.trino.sql.analyzer.Analyzer;
 import io.trino.sql.analyzer.AnalyzerFactory;
 import io.trino.sql.planner.AdaptivePlanner;
 import io.trino.sql.planner.InputExtractor;
+import io.trino.sql.parser.SqlParser;
 import io.trino.sql.planner.LogicalPlanner;
 import io.trino.sql.planner.NodePartitioningManager;
 import io.trino.sql.planner.Plan;
@@ -76,14 +86,21 @@ import io.trino.sql.planner.optimizations.AdaptivePlanOptimizer;
 import io.trino.sql.planner.optimizations.PlanOptimizer;
 import io.trino.sql.planner.plan.OutputNode;
 import io.trino.sql.tree.ExplainAnalyze;
+import io.trino.sql.tree.QualifiedName;
 import io.trino.sql.tree.Query;
 import io.trino.sql.tree.Statement;
 
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalDouble;
+import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicReference;
@@ -100,11 +117,13 @@ import static io.trino.SystemSessionProperties.isEnableDynamicFiltering;
 import static io.trino.execution.ParameterExtractor.bindParameters;
 import static io.trino.execution.QueryState.FAILED;
 import static io.trino.execution.QueryState.PLANNING;
+import static io.trino.metadata.MetadataUtil.createQualifiedObjectName;
 import static io.trino.server.DynamicFilterService.DynamicFiltersStats;
 import static io.trino.spi.StandardErrorCode.STACK_OVERFLOW;
 import static io.trino.sql.planner.sanity.PlanSanityChecker.DISTRIBUTED_PLAN_SANITY_CHECKER;
 import static io.trino.tracing.ScopedSpan.scopedSpan;
 import static java.lang.Thread.currentThread;
+import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
@@ -112,6 +131,8 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 public class SqlQueryExecution
         implements QueryExecution
 {
+    private static final Logger log = Logger.get(SqlQueryExecution.class);
+
     private final QueryStateMachine stateMachine;
     private final Slug slug;
     private final Tracer tracer;
@@ -139,6 +160,9 @@ public class SqlQueryExecution
     private final ExecutionPolicy executionPolicy;
     private final SplitSchedulerStats schedulerStats;
     private final Analysis analysis;
+    private final PreparedQuery preparedQuery;
+    private final AnalyzerFactory analyzerFactory;
+    private final CteMaterializationOrchestrator cteMaterializationOrchestrator;
     private final StatsCalculator statsCalculator;
     private final CostCalculator costCalculator;
     private final DynamicFilterService dynamicFilterService;
@@ -157,6 +181,7 @@ public class SqlQueryExecution
             Tracer tracer,
             PlannerContext plannerContext,
             AnalyzerFactory analyzerFactory,
+            CteMaterializationOrchestrator cteMaterializationOrchestrator,
             SplitSourceFactory splitSourceFactory,
             NodePartitioningManager nodePartitioningManager,
             NodeScheduler nodeScheduler,
@@ -217,6 +242,10 @@ public class SqlQueryExecution
             this.scheduleSplitBatchSize = scheduleSplitBatchSize;
 
             this.stateMachine = requireNonNull(stateMachine, "stateMachine is null");
+
+            this.preparedQuery = requireNonNull(preparedQuery, "preparedQuery is null");
+            this.analyzerFactory = requireNonNull(analyzerFactory, "analyzerFactory is null");
+            this.cteMaterializationOrchestrator = requireNonNull(cteMaterializationOrchestrator, "cteMaterializationOrchestrator is null");
 
             // analyze query
             this.analysis = analyze(preparedQuery, stateMachine, warningCollector, planOptimizersStatsCollector, analyzerFactory);
@@ -488,6 +517,9 @@ public class SqlQueryExecution
 
     private PlanRoot doPlanQuery(CachingTableStatsProvider tableStatsProvider)
     {
+        // optionally materialize multiply-referenced CTEs into scratch tables and re-analyze
+        Analysis planAnalysis = maybeMaterializeCtes();
+
         // plan query
         PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
         LogicalPlanner logicalPlanner = new LogicalPlanner(
@@ -500,7 +532,7 @@ public class SqlQueryExecution
                 stateMachine.getWarningCollector(),
                 planOptimizersStatsCollector,
                 tableStatsProvider);
-        Plan plan = logicalPlanner.plan(analysis);
+        Plan plan = logicalPlanner.plan(planAnalysis);
         queryPlan.set(plan);
 
         // fragment the plan
@@ -514,10 +546,250 @@ public class SqlQueryExecution
             stateMachine.setInputs(new InputExtractor(plannerContext.getMetadata(), stateMachine.getSession()).extractInputs(fragmentedPlan));
         }
 
-        stateMachine.setOutput(analysis.getTarget());
+        stateMachine.setOutput(planAnalysis.getTarget());
 
-        boolean explainAnalyze = analysis.getStatement() instanceof ExplainAnalyze;
+        boolean explainAnalyze = planAnalysis.getStatement() instanceof ExplainAnalyze;
         return new PlanRoot(fragmentedPlan, !explainAnalyze);
+    }
+
+    /**
+     * If CTE materialization is enabled and the statement has eligible multiply-referenced CTEs,
+     * materialize each into a per-query scratch table (committed in its own transaction), rewrite the
+     * statement to read the scratch tables, and return a fresh analysis of the rewritten statement.
+     * On any failure the feature degrades to normal inlining (returns the original analysis); scratch
+     * tables created before the failure are dropped by the terminal-state cleanup listener.
+     */
+    private Analysis maybeMaterializeCtes()
+    {
+        Session session = stateMachine.getSession();
+        CteMaterializationStrategy strategy = SystemSessionProperties.getCteMaterializationStrategy(session);
+        if (strategy == CteMaterializationStrategy.NONE) {
+            return analysis;
+        }
+        Statement statement = preparedQuery.getStatement();
+        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session, statement);
+        if (candidates.isEmpty()) {
+            return analysis;
+        }
+        Map<String, String> nameToScratch = new LinkedHashMap<>();
+        long estimatedRowsSaved = 0;
+        SqlParser parser = new SqlParser();
+        try {
+            // assign each candidate a scratch table (by source-catalog placement); candidates with no usable
+            // location are inlined. The candidate's list index keeps colliding sanitized names distinct.
+            Map<String, String> scratchTableByName = new LinkedHashMap<>();
+            for (int candidateIndex = 0; candidateIndex < candidates.size(); candidateIndex++) {
+                CteCandidate candidate = candidates.get(candidateIndex);
+                Optional<String> scratchSchema = scratchSchemaForCte(session, statement, candidate.name());
+                if (scratchSchema.isEmpty()) {
+                    // no scratch location for this CTE (no qualified source and no default schema): inline it
+                    // (a dependent CTE that is materialized will inline this one into its scratch CTAS)
+                    log.debug("CTE materialization: no scratch location for %s in query %s; inlining it",
+                            candidate.name(), stateMachine.getQueryId());
+                    cteMaterializationOrchestrator.stats().cteInlinedNoLocation();
+                    continue;
+                }
+                scratchTableByName.put(candidate.name(), scratchTableName(scratchSchema.get(), candidate.name(), session.getQueryId().getId(), candidateIndex));
+                // estimated repeated-scan rows avoided, summed over CTEs whose source size is known
+                OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
+                if (sourceRows.isPresent()) {
+                    estimatedRowsSaved += (long) ((candidate.referenceCount() - 1) * sourceRows.getAsDouble());
+                }
+            }
+            if (scratchTableByName.isEmpty()) {
+                // no candidate had a usable scratch location: inline the whole statement
+                return analysis;
+            }
+            // materialize by dependency level: CTEs in one level are independent and run concurrently
+            // (bounded by max_concurrent_materializations); a dependency's level commits before its dependents'.
+            int maxConcurrent = SystemSessionProperties.getCteMaterializationMaxConcurrentMaterializations(session);
+            List<String> toMaterialize = new ArrayList<>(scratchTableByName.keySet());
+            for (List<String> level : CteMaterializer.dependencyLevels(statement, toMaterialize)) {
+                List<String> levelTables = new ArrayList<>();
+                List<String> levelSources = new ArrayList<>();
+                for (String name : level) {
+                    String scratchTable = scratchTableByName.get(name);
+                    // prior levels are already in nameToScratch, so a dependent's source reads their scratch tables
+                    String scratchSource = CteMaterializer.buildScratchSource(statement, name, nameToScratch, parser);
+                    // register cleanup before running so a later failure still drops this table
+                    registerScratchCleanup(session, scratchTable);
+                    levelTables.add(scratchTable);
+                    levelSources.add(scratchSource);
+                }
+                cteMaterializationOrchestrator.materializeLevel(session, levelTables, levelSources, maxConcurrent);
+                for (int i = 0; i < level.size(); i++) {
+                    nameToScratch.put(level.get(i), levelTables.get(i));
+                }
+            }
+            Statement rewritten = CteMaterializer.rewrite(statement, nameToScratch, parser);
+            Analyzer analyzer = analyzerFactory.createAnalyzer(
+                    session,
+                    preparedQuery.getParameters(),
+                    bindParameters(rewritten, preparedQuery.getParameters()),
+                    stateMachine.getWarningCollector(),
+                    planOptimizersStatsCollector);
+            Analysis rewrittenAnalysis = analyzer.analyze(rewritten);
+            cteMaterializationOrchestrator.stats().queryMaterialized(nameToScratch.size(), estimatedRowsSaved);
+            log.info("CTE materialization: query %s materialized %s CTE(s) into scratch tables %s",
+                    stateMachine.getQueryId(), nameToScratch.size(), nameToScratch.values());
+            return rewrittenAnalysis;
+        }
+        catch (RuntimeException e) {
+            // the feature must never break a query: fall back to inlining the original statement
+            cteMaterializationOrchestrator.stats().materializationFallback();
+            log.warn(e, "CTE materialization failed for query %s; falling back to inlining", stateMachine.getQueryId());
+            return analysis;
+        }
+    }
+
+    /**
+     * Apply the configured strategy to the set of eligible (multiply-referenced, safe) candidates.
+     * {@code ALL} keeps every eligible CTE. {@code HEURISTIC} keeps a CTE only when it is referenced at
+     * least {@code cte_materialization_min_references} times AND its estimated repeated-scan savings —
+     * {@code (referenceCount - 1) * sourceRows} — reach {@code cte_materialization_min_scan_savings}.
+     * Savings are treated as unknown (and the CTE is kept) when table statistics are unavailable or the
+     * CTE depends on another CTE, so the gate never withholds materialization on missing stats.
+     */
+    private List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session, Statement statement)
+    {
+        List<CteCandidate> gated;
+        if (strategy == CteMaterializationStrategy.ALL) {
+            gated = eligible;
+        }
+        else {
+            int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
+            long minScanSavings = SystemSessionProperties.getCteMaterializationMinScanSavings(session);
+            ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
+            for (CteCandidate candidate : eligible) {
+                if (candidate.referenceCount() < minReferences) {
+                    continue;
+                }
+                OptionalDouble sourceRows = estimateSourceRows(session, statement, candidate.name());
+                if (sourceRows.isPresent()) {
+                    double savings = (candidate.referenceCount() - 1) * sourceRows.getAsDouble();
+                    if (savings < minScanSavings) {
+                        log.debug("CTE materialization: skipping %s (estimated saved scan rows %.0f < threshold %s)",
+                                candidate.name(), savings, minScanSavings);
+                        continue;
+                    }
+                }
+                selected.add(candidate);
+            }
+            gated = selected.build();
+        }
+        return capCandidates(gated, session);
+    }
+
+    /**
+     * Cap the number of materialized CTEs at {@code cte_materialization_max_materialized_ctes}. When more
+     * candidates qualify, keep those with the most references (the largest repeated-scan wins), breaking ties
+     * by declaration order, and inline the rest. The kept candidates are returned in declaration order so the
+     * materialization loop still sees dependencies before dependents. Dropping a dependency is safe: a kept
+     * dependent simply inlines it into its own scratch CTAS.
+     */
+    private List<CteCandidate> capCandidates(List<CteCandidate> gated, Session session)
+    {
+        int cap = SystemSessionProperties.getCteMaterializationMaxMaterializedCtes(session);
+        if (gated.size() <= cap) {
+            return gated;
+        }
+        List<CteCandidate> byReferences = new ArrayList<>(gated);
+        byReferences.sort(Comparator.comparingInt(CteCandidate::referenceCount).reversed());
+        Set<String> keep = new HashSet<>();
+        for (CteCandidate candidate : byReferences.subList(0, cap)) {
+            keep.add(candidate.name());
+        }
+        log.debug("CTE materialization: capping materialized CTEs at %s of %s eligible for query %s",
+                cap, gated.size(), stateMachine.getQueryId());
+        ImmutableList.Builder<CteCandidate> capped = ImmutableList.builder();
+        for (CteCandidate candidate : gated) {
+            if (keep.contains(candidate.name())) {
+                capped.add(candidate);
+            }
+        }
+        return capped.build();
+    }
+
+    /**
+     * Sum of base-table row counts scanned by a CTE body, for the HEURISTIC cost gate. Empty when the CTE
+     * depends on another CTE, when a table cannot be resolved, or when any table's row-count statistic is
+     * unknown — i.e. whenever we cannot confidently size the scan (the caller then declines to prune).
+     */
+    private OptionalDouble estimateSourceRows(Session session, Statement statement, String cteName)
+    {
+        Optional<List<QualifiedName>> tables = CteMaterializer.sourceTablesForCostEstimate(statement, cteName);
+        if (tables.isEmpty()) {
+            return OptionalDouble.empty();
+        }
+        Metadata metadata = plannerContext.getMetadata();
+        double total = 0;
+        try {
+            for (QualifiedName table : tables.get()) {
+                QualifiedObjectName name = createQualifiedObjectName(session, statement, table);
+                Optional<TableHandle> handle = metadata.getTableHandle(session, name);
+                if (handle.isEmpty()) {
+                    return OptionalDouble.empty();
+                }
+                Estimate rowCount = metadata.getTableStatistics(session, handle.get()).getRowCount();
+                if (rowCount.isUnknown()) {
+                    return OptionalDouble.empty();
+                }
+                total += rowCount.getValue();
+            }
+        }
+        catch (RuntimeException e) {
+            // any resolution/stats failure -> unknown, do not prune
+            return OptionalDouble.empty();
+        }
+        return OptionalDouble.of(total);
+    }
+
+    /**
+     * Catalog.schema in which to create the scratch table for one CTE. The scratch table is placed in the
+     * same catalog as the data the CTE reads — its first fully-qualified ({@code catalog.schema.table})
+     * source table — so a CTE reading a non-Iceberg catalog is not materialized into Iceberg. When the CTE
+     * references no qualified table (everything resolves through the session default), the session's default
+     * catalog+schema is used; failing that, any fully-qualified source table in the statement. The resulting
+     * source catalog is then redirected to its configured {@code cte-materialization.scratch-schemas} target
+     * (e.g. a dedicated {@code temp_cte} schema) when one is set. Empty when no location can be determined.
+     */
+    private Optional<String> scratchSchemaForCte(Session session, Statement statement, String cteName)
+    {
+        Optional<String> sourceCatalogSchema = CteMaterializer.firstQualifiedTableForCte(statement, cteName)
+                .map(name -> name.getParts().get(0) + "." + name.getParts().get(1));
+        if (sourceCatalogSchema.isEmpty() && session.getCatalog().isPresent() && session.getSchema().isPresent()) {
+            sourceCatalogSchema = Optional.of(session.getCatalog().get() + "." + session.getSchema().get());
+        }
+        if (sourceCatalogSchema.isEmpty()) {
+            sourceCatalogSchema = CteMaterializer.firstQualifiedTable(statement)
+                    .map(name -> name.getParts().get(0) + "." + name.getParts().get(1));
+        }
+        return sourceCatalogSchema.map(catalogSchema -> {
+            String sourceCatalog = catalogSchema.substring(0, catalogSchema.indexOf('.'));
+            return cteMaterializationOrchestrator.scratchSchemaOverride(sourceCatalog).orElse(catalogSchema);
+        });
+    }
+
+    /**
+     * Scratch table name {@code cte_<sanitized-cte-name>_<candidate-index>_<query-id>}. The candidate index
+     * disambiguates CTE names that sanitize to the same string (e.g. {@code "a-b"} and {@code a_b} both
+     * become {@code a_b}); without it the second CTAS would collide ("table already exists") and abort the
+     * whole materialization. The query id stays last so the orphan sweeper can still extract it from the
+     * trailing portion of the name.
+     */
+    private static String scratchTableName(String scratchSchema, String cteName, String queryId, int candidateIndex)
+    {
+        String sanitized = cteName.toLowerCase(ENGLISH).replaceAll("[^a-z0-9_]", "_");
+        return scratchSchema + ".cte_" + sanitized + "_" + candidateIndex + "_" + queryId;
+    }
+
+    private void registerScratchCleanup(Session session, String scratchTable)
+    {
+        stateMachine.addStateChangeListener(state -> {
+            if (state.isDone()) {
+                cteMaterializationOrchestrator.cleanupAsync(session, scratchTable);
+            }
+        });
     }
 
     private void planDistribution(PlanRoot plan, CachingTableStatsProvider tableStatsProvider)
@@ -784,6 +1056,7 @@ public class SqlQueryExecution
         private final int scheduleSplitBatchSize;
         private final PlannerContext plannerContext;
         private final AnalyzerFactory analyzerFactory;
+        private final CteMaterializationOrchestrator cteMaterializationOrchestrator;
         private final SplitSourceFactory splitSourceFactory;
         private final NodePartitioningManager nodePartitioningManager;
         private final NodeScheduler nodeScheduler;
@@ -817,6 +1090,7 @@ public class SqlQueryExecution
                 QueryManagerConfig config,
                 PlannerContext plannerContext,
                 AnalyzerFactory analyzerFactory,
+                CteMaterializationOrchestrator cteMaterializationOrchestrator,
                 SplitSourceFactory splitSourceFactory,
                 NodePartitioningManager nodePartitioningManager,
                 NodeScheduler nodeScheduler,
@@ -849,6 +1123,7 @@ public class SqlQueryExecution
             this.scheduleSplitBatchSize = config.getScheduleSplitBatchSize();
             this.plannerContext = requireNonNull(plannerContext, "plannerContext is null");
             this.analyzerFactory = requireNonNull(analyzerFactory, "analyzerFactory is null");
+            this.cteMaterializationOrchestrator = requireNonNull(cteMaterializationOrchestrator, "cteMaterializationOrchestrator is null");
             this.splitSourceFactory = requireNonNull(splitSourceFactory, "splitSourceFactory is null");
             this.nodePartitioningManager = requireNonNull(nodePartitioningManager, "nodePartitioningManager is null");
             this.nodeScheduler = requireNonNull(nodeScheduler, "nodeScheduler is null");
@@ -897,6 +1172,7 @@ public class SqlQueryExecution
                     tracer,
                     plannerContext,
                     analyzerFactory,
+                    cteMaterializationOrchestrator,
                     splitSourceFactory,
                     nodePartitioningManager,
                     nodeScheduler,

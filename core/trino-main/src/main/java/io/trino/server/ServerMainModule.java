@@ -37,6 +37,7 @@ import io.trino.SystemSessionProperties;
 import io.trino.SystemSessionPropertiesProvider;
 import io.trino.block.BlockJsonSerde;
 import io.trino.connector.system.SystemConnectorModule;
+import io.trino.cte.CteMaterializationConfig;
 import io.trino.dispatcher.DispatchManager;
 import io.trino.exchange.ExchangeMetricsCollector;
 import io.trino.execution.DynamicFilterConfig;
@@ -222,6 +223,10 @@ public class ServerMainModule
         if (retryPolicy == TASK) {
             configBinder(binder).bindConfigDefaults(FeaturesConfig.class, FeaturesConfig::applyFaultTolerantExecutionDefaults);
         }
+
+        // CTE materialization config: session-property defaults (used by SystemSessionProperties, bound
+        // here so it is available on workers too) and the orphan-sweeper settings (used on the coordinator)
+        configBinder(binder).bindConfig(CteMaterializationConfig.class);
 
         configBinder(binder).bindConfig(OptimizerConfig.class);
         configBinder(binder).bindConfig(ProtocolConfig.class);

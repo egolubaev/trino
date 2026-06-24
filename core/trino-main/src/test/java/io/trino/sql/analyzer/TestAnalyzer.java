@@ -37,6 +37,7 @@ import io.trino.connector.TestingTableFunctions.TableArgumentFunction;
 import io.trino.connector.TestingTableFunctions.TableArgumentRowSemanticsFunction;
 import io.trino.connector.TestingTableFunctions.TwoScalarArgumentsFunction;
 import io.trino.connector.TestingTableFunctions.TwoTableArgumentsFunction;
+import io.trino.cte.CteMaterializationConfig;
 import io.trino.execution.DynamicFilterConfig;
 import io.trino.execution.QueryManagerConfig;
 import io.trino.execution.TaskManagerConfig;
@@ -1164,7 +1165,8 @@ public class TestAnalyzer
                 new OptimizerConfig(),
                 new NodeMemoryConfig(),
                 new DynamicFilterConfig(),
-                new NodeSchedulerConfig()))).build();
+                new NodeSchedulerConfig(),
+                new CteMaterializationConfig()))).build();
         analyze(session, "SELECT a, b, c, d, e, f, g, h, i, j, k, SUM(l)" +
                 "FROM (VALUES (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12))\n" +
                 "t (a, b, c, d, e, f, g, h, i, j, k, l)\n" +

@@ -1,0 +1,197 @@
+# Dev stack for the Trino fork: Lakekeeper (Iceberg REST catalog) + MinIO + Trino.
+#
+#   docker compose up -d --build
+#
+# Bring-up order is enforced via healthchecks / completion conditions:
+#   minio + mc  ->  lakekeeper-db  ->  migrate  ->  lakekeeper(serve)
+#               ->  bootstrap  ->  initialwarehouse  ->  trino
+#
+# Lakekeeper version is pinned in catalog/lakekeeper/Dockerfile to match prod
+# (infra-analytics/apps/lakekeeper -> v0.12.3).
+#
+# Trino reads its config from ./dev/trino (copied from airflow_data_dags/dev/trino;
+# the iceberg catalogs were rewired from the old Nessie endpoint to Lakekeeper:
+#   iceberg.rest-catalog.uri      = http://lakekeeper:8181/catalog
+#   iceberg.rest-catalog.warehouse = warehouse
+# ). Trino is served over HTTPS on :8443 (PASSWORD auth, see dev/trino/etc).
+
+name: trino-lakekeeper-dev
+
+services:
+  # ---- Object storage (S3) --------------------------------------------------
+  minio:
+    image: minio/minio
+    container_name: minio
+    environment:
+      - MINIO_ROOT_USER=admin
+      - MINIO_ROOT_PASSWORD=password
+      - MINIO_DOMAIN=minio
+    ports:
+      - 9001:9001
+      - 9000:9000
+    command: [ "server", "/data", "--console-address", ":9001" ]
+    networks:
+      - default
+
+  # Creates (and resets) the `warehouse` bucket, then stays alive.
+  mc:
+    depends_on:
+      - minio
+    image: minio/mc
+    container_name: mc
+    environment:
+      - AWS_ACCESS_KEY_ID=admin
+      - AWS_SECRET_ACCESS_KEY=password
+      - AWS_REGION=us-east-1
+      - AWS_PROFILE=dev
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set minio http://minio:9000 admin password) do echo '...waiting...' && sleep 1; done;
+      /usr/bin/mc rm -r --force minio/warehouse;
+      /usr/bin/mc mb minio/warehouse;
+      /usr/bin/mc policy set public minio/warehouse;
+      /usr/bin/mc anonymous set public minio/warehouse;
+      tail -f /dev/null
+      "
+    networks:
+      - default
+
+  # ---- Lakekeeper metadata database ----------------------------------------
+  lakekeeper-db:
+    image: postgres:17
+    container_name: lakekeeper-db
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres" ]
+      interval: 2s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+    networks:
+      - default
+
+  # ---- Lakekeeper schema migration (one-shot) ------------------------------
+  migrate:
+    build: ./catalog/lakekeeper
+    image: lakekeeper:v0.12.3
+    container_name: lakekeeper-migrate
+    command: [ "migrate" ]
+    restart: "no"
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - RUST_LOG=info
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    networks:
+      - default
+
+  # ---- Lakekeeper Iceberg REST catalog -------------------------------------
+  lakekeeper:
+    build: ./catalog/lakekeeper
+    image: lakekeeper:v0.12.3
+    container_name: lakekeeper
+    command: [ "serve" ]
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
+      - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=allowall
+      - RUST_LOG=info
+    healthcheck:
+      test: [ "CMD", "/home/nonroot/lakekeeper", "healthcheck" ]
+      interval: 2s
+      timeout: 10s
+      retries: 5
+      start_period: 5s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      lakekeeper-db:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    ports:
+      - 8181:8181
+    networks:
+      - default
+
+  # ---- Bootstrap the catalog (accept terms of use, init server) ------------
+  bootstrap:
+    image: curlimages/curl
+    container_name: lakekeeper-bootstrap
+    restart: "no"
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    command:
+      - -w
+      - "%{http_code}"
+      - -X
+      - POST
+      - -v
+      - http://lakekeeper:8181/management/v1/bootstrap
+      - -H
+      - "Content-Type: application/json"
+      - --data
+      - '{"accept-terms-of-use": true}'
+      - -o
+      - /dev/null
+    networks:
+      - default
+
+  # ---- Create the default `warehouse` (S3/MinIO storage profile) -----------
+  initialwarehouse:
+    image: curlimages/curl
+    container_name: lakekeeper-initialwarehouse
+    restart: "no"
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
+      mc:
+        condition: service_started
+    command:
+      - -w
+      - "%{http_code}"
+      - -X
+      - POST
+      - -v
+      - http://lakekeeper:8181/management/v1/warehouse
+      - -H
+      - "Content-Type: application/json"
+      - --data
+      - "@/tmp/create-default-warehouse.json"
+      - -o
+      - /dev/null
+    volumes:
+      - ./create-default-warehouse.json:/tmp/create-default-warehouse.json:ro
+    networks:
+      - default
+
+  # ---- Trino (fork build my-trino-481 with CTE materialization M1) ----------
+  trino:
+    image: 'trino:481-arm64'
+    container_name: trino
+    hostname: trino
+    depends_on:
+      initialwarehouse:
+        condition: service_completed_successfully
+    ports:
+      - '8443:8443'
+      - '8080:8080'   # HTTP Web UI: http://localhost:8080/ui  (admin/admin)
+    volumes:
+      - ./dev/trino/etc:/etc/trino
+      - ./dev/trino/conf:/etc/trino/conf
+      - ./dev/trino/etc/password-authenticator.properties:/etc/password-authenticator.properties
+    networks:
+      - default
+
+networks:
+  default:
