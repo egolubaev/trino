@@ -37,6 +37,7 @@ import static com.google.common.io.MoreFiles.deleteRecursively;
 import static com.google.common.io.RecursiveDeleteOption.ALLOW_INSECURE;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES;
+import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MAX_OUTPUT_ROWS;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_REFERENCES;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_MIN_SCAN_SAVINGS;
 import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
@@ -419,6 +420,45 @@ public class TestCteMaterializationEndToEnd
         assertThat(scratchSubmittedFor(runner, ".cte_a_")).as("a materialized").isTrue();
         assertThat(scratchSubmittedFor(runner, ".cte_b_")).as("b materialized").isTrue();
         assertThat(scratchSubmittedFor(runner, ".cte_c_")).as("c materialized").isTrue();
+    }
+
+    @Test
+    public void testMaxOutputRowsSkipsLargeOutputCte()
+    {
+        QueryRunner runner = getQueryRunner();
+        runner.execute("DROP TABLE IF EXISTS iceberg." + SCHEMA + ".srcout");
+        runner.execute("CREATE TABLE iceberg." + SCHEMA + ".srcout AS " +
+                "SELECT * FROM (VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)) t(k, v)");
+        runner.execute("ANALYZE iceberg." + SCHEMA + ".srcout");
+
+        // passthrough CTE: output rows == input rows (5), reliably estimated from table statistics
+        @Language("SQL") String query =
+                "WITH xo AS (SELECT k, v FROM iceberg." + SCHEMA + ".srcout) " +
+                "SELECT a.k, b.v FROM xo a JOIN xo b ON a.k = b.k ORDER BY a.k";
+
+        // estimated output ~5 rows; with the limit at 1 the CTE must NOT be materialized
+        Session lowOutputLimit = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, "1")
+                .setSystemProperty(CTE_MATERIALIZATION_MAX_OUTPUT_ROWS, "1")
+                .build();
+        runner.execute(lowOutputLimit, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_xo_"))
+                .as("HEURISTIC must not materialize a CTE whose estimated output exceeds max_output_rows")
+                .isFalse();
+
+        // with a high limit the same CTE is materialized
+        Session highOutputLimit = Session.builder(getSession())
+                .setSchema(SCHEMA)
+                .setSystemProperty(CTE_MATERIALIZATION_STRATEGY, "HEURISTIC")
+                .setSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, "1")
+                .setSystemProperty(CTE_MATERIALIZATION_MAX_OUTPUT_ROWS, "1000000")
+                .build();
+        runner.execute(highOutputLimit, query);
+        assertThat(scratchSubmittedFor(runner, ".cte_xo_"))
+                .as("HEURISTIC must materialize when estimated output is within max_output_rows")
+                .isTrue();
     }
 
     private static boolean scratchSubmittedFor(QueryRunner runner, String scratchInfix)

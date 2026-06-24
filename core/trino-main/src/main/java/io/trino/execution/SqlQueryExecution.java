@@ -28,6 +28,7 @@ import io.trino.Session;
 import io.trino.SystemSessionProperties;
 import io.trino.cost.CachingTableStatsProvider;
 import io.trino.cost.CostCalculator;
+import io.trino.cost.PlanNodeStatsEstimate;
 import io.trino.cost.StatsCalculator;
 import io.trino.cte.CteMaterializationOrchestrator;
 import io.trino.cte.CteMaterializationStrategy;
@@ -518,7 +519,7 @@ public class SqlQueryExecution
     private PlanRoot doPlanQuery(CachingTableStatsProvider tableStatsProvider)
     {
         // optionally materialize multiply-referenced CTEs into scratch tables and re-analyze
-        Analysis planAnalysis = maybeMaterializeCtes();
+        Analysis planAnalysis = maybeMaterializeCtes(tableStatsProvider);
 
         // plan query
         PlanNodeIdAllocator idAllocator = new PlanNodeIdAllocator();
@@ -559,7 +560,7 @@ public class SqlQueryExecution
      * On any failure the feature degrades to normal inlining (returns the original analysis); scratch
      * tables created before the failure are dropped by the terminal-state cleanup listener.
      */
-    private Analysis maybeMaterializeCtes()
+    private Analysis maybeMaterializeCtes(CachingTableStatsProvider tableStatsProvider)
     {
         Session session = stateMachine.getSession();
         CteMaterializationStrategy strategy = SystemSessionProperties.getCteMaterializationStrategy(session);
@@ -567,13 +568,13 @@ public class SqlQueryExecution
             return analysis;
         }
         Statement statement = preparedQuery.getStatement();
-        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session, statement);
+        SqlParser parser = new SqlParser();
+        List<CteCandidate> candidates = selectCandidates(CteMaterializer.findCandidates(statement), strategy, session, statement, parser, tableStatsProvider);
         if (candidates.isEmpty()) {
             return analysis;
         }
         Map<String, String> nameToScratch = new LinkedHashMap<>();
         long estimatedRowsSaved = 0;
-        SqlParser parser = new SqlParser();
         try {
             // assign each candidate a scratch table (by source-catalog placement); candidates with no usable
             // location are inlined. The candidate's list index keeps colliding sanitized names distinct.
@@ -645,12 +646,14 @@ public class SqlQueryExecution
     /**
      * Apply the configured strategy to the set of eligible (multiply-referenced, safe) candidates.
      * {@code ALL} keeps every eligible CTE. {@code HEURISTIC} keeps a CTE only when it is referenced at
-     * least {@code cte_materialization_min_references} times AND its estimated repeated-scan savings —
-     * {@code (referenceCount - 1) * sourceRows} — reach {@code cte_materialization_min_scan_savings}.
-     * Savings are treated as unknown (and the CTE is kept) when table statistics are unavailable or the
-     * CTE depends on another CTE, so the gate never withholds materialization on missing stats.
+     * least {@code cte_materialization_min_references} times, its estimated repeated-scan savings —
+     * {@code (referenceCount - 1) * sourceRows} — reach {@code cte_materialization_min_scan_savings}, AND its
+     * estimated output does not exceed {@code cte_materialization_max_output_rows}. Input savings and output
+     * size are each treated as unknown (and the CTE is kept) when statistics are unavailable, so the gate
+     * never withholds materialization on missing stats; it only ever declines when it can show the repeated
+     * scan is small or the scratch table would be large.
      */
-    private List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session, Statement statement)
+    private List<CteCandidate> selectCandidates(List<CteCandidate> eligible, CteMaterializationStrategy strategy, Session session, Statement statement, SqlParser parser, CachingTableStatsProvider tableStatsProvider)
     {
         List<CteCandidate> gated;
         if (strategy == CteMaterializationStrategy.ALL) {
@@ -659,6 +662,7 @@ public class SqlQueryExecution
         else {
             int minReferences = SystemSessionProperties.getCteMaterializationMinReferences(session);
             long minScanSavings = SystemSessionProperties.getCteMaterializationMinScanSavings(session);
+            long maxOutputRows = SystemSessionProperties.getCteMaterializationMaxOutputRows(session);
             ImmutableList.Builder<CteCandidate> selected = ImmutableList.builder();
             for (CteCandidate candidate : eligible) {
                 if (candidate.referenceCount() < minReferences) {
@@ -673,11 +677,67 @@ public class SqlQueryExecution
                         continue;
                     }
                 }
+                // output-size gate: a CTE whose result is large is expensive to write and re-read as a scratch
+                // table, reads back with little parallelism (few files), and loses predicate/dynamic-filter
+                // pushdown into its consumers — re-scanning is usually cheaper. Skip when the estimate exceeds
+                // the limit; an unknown estimate never blocks (fail-open).
+                if (maxOutputRows > 0) {
+                    OptionalDouble outputRows = estimateOutputRows(session, statement, candidate.name(), parser, tableStatsProvider);
+                    if (outputRows.isPresent() && outputRows.getAsDouble() > maxOutputRows) {
+                        log.debug("CTE materialization: skipping %s (estimated output rows %.0f > threshold %s)",
+                                candidate.name(), outputRows.getAsDouble(), maxOutputRows);
+                        continue;
+                    }
+                }
                 selected.add(candidate);
             }
             gated = selected.build();
         }
         return capCandidates(gated, session);
+    }
+
+    /**
+     * Estimate the number of rows a CTE produces, for the HEURISTIC output-size gate. The CTE body (with its
+     * dependency closure inlined, exactly as it would be materialized) is analyzed and planned to the initial
+     * {@code CREATED} stage — no optimizer passes — and the cost-based row estimate of the plan root is read.
+     * Empty when the estimate is unknown or anything fails, so the caller never blocks on it.
+     */
+    private OptionalDouble estimateOutputRows(Session session, Statement statement, String cteName, SqlParser parser, CachingTableStatsProvider tableStatsProvider)
+    {
+        try {
+            Statement cteStatement = parser.createStatement(CteMaterializer.buildScratchSource(statement, cteName, Map.of(), parser));
+            Analyzer analyzer = analyzerFactory.createAnalyzer(
+                    session,
+                    preparedQuery.getParameters(),
+                    bindParameters(cteStatement, preparedQuery.getParameters()),
+                    WarningCollector.NOOP,
+                    planOptimizersStatsCollector);
+            Analysis cteAnalysis = analyzer.analyze(cteStatement);
+            LogicalPlanner planner = new LogicalPlanner(
+                    session,
+                    planOptimizers,
+                    new PlanNodeIdAllocator(),
+                    plannerContext,
+                    statsCalculator,
+                    costCalculator,
+                    WarningCollector.NOOP,
+                    planOptimizersStatsCollector,
+                    tableStatsProvider);
+            // collectPlanStatistics=true: the CREATED stage runs no optimizer to populate the stats cache,
+            // so fetch table statistics fresh, otherwise the root estimate would be unknown
+            Plan plan = planner.plan(cteAnalysis, LogicalPlanner.Stage.CREATED, true);
+            PlanNodeStatsEstimate rootStats = plan.getStatsAndCosts().getStats().get(plan.getRoot().getId());
+            if (rootStats == null) {
+                return OptionalDouble.empty();
+            }
+            double outputRowCount = rootStats.getOutputRowCount();
+            return Double.isNaN(outputRowCount) ? OptionalDouble.empty() : OptionalDouble.of(outputRowCount);
+        }
+        catch (RuntimeException e) {
+            // any analysis/planning failure -> unknown, do not prune
+            log.debug(e, "CTE materialization: could not estimate output rows for %s; treating as unknown", cteName);
+            return OptionalDouble.empty();
+        }
     }
 
     /**

@@ -46,6 +46,7 @@ public class CteMaterializationConfig
     private CteMaterializationStrategy strategy = CteMaterializationStrategy.NONE;
     private int minReferences = 2;
     private long minScanSavings = 1_000_000;
+    private long maxOutputRows = 5_000_000;
     private int maxMaterializedCtes = 8;
     private int maxConcurrentMaterializations = 4;
 
@@ -94,6 +95,20 @@ public class CteMaterializationConfig
     public CteMaterializationConfig setMinScanSavings(long minScanSavings)
     {
         this.minScanSavings = minScanSavings;
+        return this;
+    }
+
+    @Min(0)
+    public long getMaxOutputRows()
+    {
+        return maxOutputRows;
+    }
+
+    @Config("cte-materialization.max-output-rows")
+    @ConfigDescription("Cluster default for cte_materialization_max_output_rows: under HEURISTIC, do not materialize a CTE whose estimated output exceeds this many rows (writing/re-reading a large scratch table rarely beats re-scanning); 0 disables the check")
+    public CteMaterializationConfig setMaxOutputRows(long maxOutputRows)
+    {
+        this.maxOutputRows = maxOutputRows;
         return this;
     }
 

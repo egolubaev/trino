@@ -227,6 +227,7 @@ public final class SystemSessionProperties
     public static final String CTE_MATERIALIZATION_STRATEGY = "cte_materialization_strategy";
     public static final String CTE_MATERIALIZATION_MIN_REFERENCES = "cte_materialization_min_references";
     public static final String CTE_MATERIALIZATION_MIN_SCAN_SAVINGS = "cte_materialization_min_scan_savings";
+    public static final String CTE_MATERIALIZATION_MAX_OUTPUT_ROWS = "cte_materialization_max_output_rows";
     public static final String CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES = "cte_materialization_max_materialized_ctes";
     public static final String CTE_MATERIALIZATION_MAX_CONCURRENT_MATERIALIZATIONS = "cte_materialization_max_concurrent_materializations";
 
@@ -307,6 +308,12 @@ public final class SystemSessionProperties
                         "Under the HEURISTIC strategy, only materialize a CTE when its estimated repeated-scan savings, (references - 1) * source rows, reaches this many rows (savings are treated as unknown -> materialize when table statistics are unavailable)",
                         cteMaterializationConfig.getMinScanSavings(),
                         value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MIN_SCAN_SAVINGS),
+                        false),
+                longProperty(
+                        CTE_MATERIALIZATION_MAX_OUTPUT_ROWS,
+                        "Under the HEURISTIC strategy, do not materialize a CTE whose estimated output exceeds this many rows (a large scratch table is expensive to write/re-read and loses predicate/dynamic-filter pushdown); 0 disables the check",
+                        cteMaterializationConfig.getMaxOutputRows(),
+                        value -> validateNonNegativeLongValue(value, CTE_MATERIALIZATION_MAX_OUTPUT_ROWS),
                         false),
                 integerProperty(
                         CTE_MATERIALIZATION_MAX_MATERIALIZED_CTES,
@@ -1278,6 +1285,11 @@ public final class SystemSessionProperties
     public static long getCteMaterializationMinScanSavings(Session session)
     {
         return session.getSystemProperty(CTE_MATERIALIZATION_MIN_SCAN_SAVINGS, Long.class);
+    }
+
+    public static long getCteMaterializationMaxOutputRows(Session session)
+    {
+        return session.getSystemProperty(CTE_MATERIALIZATION_MAX_OUTPUT_ROWS, Long.class);
     }
 
     public static int getCteMaterializationMaxMaterializedCtes(Session session)
