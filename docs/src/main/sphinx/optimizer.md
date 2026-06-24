@@ -8,4 +8,5 @@ optimizer/cost-in-explain
 optimizer/cost-based-optimizations
 optimizer/pushdown
 optimizer/adaptive-plan-optimizations
+optimizer/cte-materialization
 ```
