@@ -72,8 +72,21 @@ already rejected by analysis). Form 1 is cleaner and handles set operations. Bou
 - **Reference count across the whole statement.** Counting references in sibling CTE bodies too means a
   CTE shared by two materialized siblings is itself materialized once, instead of re-scanned per sibling.
 - **Cost gate prunes, never blocks.** Under `HEURISTIC`, unknown statistics ⇒ materialize. The gate only
-  declines when it can *prove* the repeated scan is small, so missing stats never silently disable the
-  feature.
+  declines when it can *prove* the repeated scan is small (input gate) or that the scratch table would be
+  large (output gate), so missing stats never silently disable the feature.
+- **Output-size gate (`cte_materialization_max_output_rows`, default 5M).** The input gate
+  (`(refs-1)*source_rows`) measures the *benefit* (re-scans avoided) but is blind to the *cost*: writing the
+  CTE result to a scratch table and reading it back per reference. A prod query regressed 30s → 3min when a
+  non-aggregating `UNION ALL` CTE (~50M-row output) was materialized: its two consumers then ran an
+  expensive `regexp_like` over all 50M rows (vs ~11.5M inlined, because materialization is an optimization
+  barrier that kills predicate/dynamic-filter pushdown), and the small scratch table produced too few splits
+  so that work ran nearly single-threaded (9k drivers vs 55k inlined; the regexp scans showed CPU≈wall≈600s).
+  The fix: estimate the CTE's **output** rows by planning its body to the `CREATED` stage (initial plan, no
+  optimizer; `collectPlanStatistics=true` so table stats are fetched since no optimizer pass populates the
+  cache) and reading the cost-based root row estimate; skip materialization when it exceeds the limit.
+  Output size is the right signal — aggregating CTEs (small output, the sweet spot) pass; large pass-through
+  CTEs are inlined. Unknown estimate ⇒ do not block (fail-open). Only under `HEURISTIC`; `ALL` still
+  materializes everything.
 - **Per-CTE, source-catalog-derived scratch placement.** Each materialized CTE is placed in the **same
   catalog as the data it reads** (its first fully-qualified source table, following the CTE's dependency
   closure), not in the session's default catalog. This is the multi-connector fix: a CTE that reads a

@@ -45,7 +45,6 @@ import java.util.concurrent.TimeUnit;
 
 import static com.google.common.base.Preconditions.checkArgument;
 import static io.airlift.concurrent.Threads.daemonThreadsNamed;
-import static io.trino.SystemSessionProperties.CTE_MATERIALIZATION_STRATEGY;
 import static io.trino.execution.QueryState.FAILED;
 import static java.util.Locale.ENGLISH;
 import static java.util.Objects.requireNonNull;
@@ -271,9 +270,13 @@ public class CteMaterializationOrchestrator
 
     private QueryId run(Session parentSession, @Language("SQL") String sql)
     {
-        // run in a fresh autocommit transaction, with CTE materialization disabled to avoid recursion
-        SessionContext context = SessionContext.fromSessionWithoutTransaction(parentSession)
-                .withSystemProperty(CTE_MATERIALIZATION_STRATEGY, CteMaterializationStrategy.NONE.name());
+        // Fresh autocommit transaction. We deliberately do NOT set cte_materialization_strategy=NONE on the
+        // child: the internal statements are CREATE TABLE ... AS / DROP TABLE, which are not Query statements,
+        // so CteMaterializer.findCandidates never matches them and materialization cannot recurse. Setting a
+        // system session property here would instead be validated against the *end user's* permissions at
+        // transaction begin (e.g. OPA's checkCanSetSystemSessionProperty), failing the internal CTAS/DROP for
+        // any user not allowed to set that property.
+        SessionContext context = SessionContext.fromSessionWithoutTransaction(parentSession);
         DispatchQuery query = client().execute(context, sql, DISCARD_RESULTS);
         QueryInfo info = query.getFullQueryInfo();
         if (info.getState() == FAILED) {

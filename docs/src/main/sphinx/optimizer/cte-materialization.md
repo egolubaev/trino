@@ -71,8 +71,9 @@ Controls when an eligible, multiply-referenced CTE is materialized.
 - `NONE` — never materialize; CTEs are inlined (stock behavior).
 - `ALL` — materialize every eligible CTE.
 - `HEURISTIC` — materialize an eligible CTE only when it is referenced at least
-  `cte_materialization_min_references` times **and** its estimated repeated-scan savings reach
-  `cte_materialization_min_scan_savings` (see below).
+  `cte_materialization_min_references` times, its estimated repeated-scan savings reach
+  `cte_materialization_min_scan_savings`, **and** its estimated output is within
+  `cte_materialization_max_output_rows` (see below).
 
 ### `cte_materialization_min_references`
 
@@ -93,6 +94,19 @@ the base tables the CTE scans, taken from table statistics. When statistics are 
 cannot be resolved, or the CTE depends on another CTE, the savings are treated as unknown and the CTE
 is materialized — the heuristic only ever *declines* to materialize when it can show the repeated scan
 is small.
+
+### `cte_materialization_max_output_rows`
+
+- **Type:** {ref}`prop-type-integer`
+- **Default value:** `5000000` (cluster default: `cte-materialization.max-output-rows`)
+
+Under `HEURISTIC`, a CTE whose estimated **output** exceeds this many rows is not materialized. The
+estimate comes from cost-based planning of the CTE body. A large result is expensive to write to a scratch
+table and read back once per reference, reads back with little parallelism (a small scratch table has few
+files, so few splits), and — because the scratch table is an optimization barrier — loses predicate and
+dynamic-filter pushdown from the CTE's consumers; for such CTEs re-scanning is usually cheaper than
+materializing. Aggregating CTEs, whose output is small, pass this gate; large pass-through or `UNION ALL`
+CTEs are inlined. Set to `0` to disable the check. An unknown estimate never blocks materialization.
 
 ### `cte_materialization_max_materialized_ctes`
 
@@ -140,6 +154,13 @@ Cluster-wide default for `cte_materialization_min_references`.
 - **Default value:** `1000000`
 
 Cluster-wide default for `cte_materialization_min_scan_savings`.
+
+### `cte-materialization.max-output-rows`
+
+- **Type:** {ref}`prop-type-integer`
+- **Default value:** `5000000`
+
+Cluster-wide default for `cte_materialization_max_output_rows`.
 
 ### `cte-materialization.max-materialized-ctes`
 

@@ -1,7 +1,7 @@
 # CTE materialization (fork feature)
 
-Automatic materialization of multiply-referenced CTEs into per-query Iceberg scratch tables, so a CTE's
-expensive scan/aggregation runs **once** instead of once per textual reference. Branch `my-trino-481`
+Automatic materialization of multiply-referenced CTEs into per-query scratch tables, so a CTE's
+expensive scan/aggregation runs **once** instead of once per textual reference. Branch `cte_materializing`
 (Trino 481).
 
 This directory is the internal engineering record. The user-facing reference lives in the main docs at
@@ -11,6 +11,11 @@ This directory is the internal engineering record. The user-facing reference liv
   request flow, and where each piece lives in the tree.
 - [design-decisions.md](design-decisions.md) — why it is built this way, the deliberate limitations
   (non-determinism, column aliases), what is **not** done and why, and the in-engine alternative (M7).
+- [grafana-dashboard.json](grafana-dashboard.json) — importable Grafana dashboard over the
+  `trino.cte:name=CteMaterializationStats` JMX metrics (health / adoption / cost). Grafana → Dashboards →
+  New → Import → upload the file, pick the Prometheus datasource. Queries use case-insensitive `__name__`
+  regexes (`trino_cte.*…`) so they match regardless of how the JMX exporter renders the MBean name; if no
+  series show, confirm the exact names in Prometheus with `{__name__=~"(?i)trino_cte.*"}`.
 
 ## The problem
 
